@@ -69,6 +69,23 @@ room:
 	require.Error(t, err)
 }
 
+func TestBulkConfigDefaults(t *testing.T) {
+	conf, err := NewConfig("", true, nil, nil)
+	require.NoError(t, err)
+
+	// 0 means "use GOMAXPROCS", resolved in the service, not here.
+	require.Equal(t, 0, conf.Bulk.Workers)
+	require.Equal(t, 5000, conf.Bulk.MaxItems)
+}
+
+func TestBulkConfigFromYaml(t *testing.T) {
+	conf, err := NewConfig("bulk:\n  workers: 8\n  max_items: 100\n", true, nil, nil)
+	require.NoError(t, err)
+
+	require.Equal(t, 8, conf.Bulk.Workers)
+	require.Equal(t, 100, conf.Bulk.MaxItems)
+}
+
 func TestGeneratedFlags(t *testing.T) {
 	generatedFlags, err := GenerateCLIFlags(nil, false)
 	require.NoError(t, err)

@@ -115,6 +115,8 @@ type Config struct {
 	EnableParticipantDataBlob bool `yaml:"enable_participant_data_blob,omitempty"`
 
 	API APIConfig `yaml:"api,omitempty"`
+
+	Bulk BulkConfig `yaml:"bulk,omitempty"`
 }
 
 type RTCConfig struct {
@@ -358,6 +360,22 @@ type LimitConfig struct {
 	MaxAPIRequestBodySize int64 `yaml:"max_api_request_body_size,omitempty"`
 }
 
+// BulkConfig tunes the bulk participant endpoint (POST /bulk/v1/participants).
+type BulkConfig struct {
+	// Workers is the number of goroutines applying items concurrently.
+	// 0 means runtime.GOMAXPROCS(0).
+	Workers int `yaml:"workers,omitempty"`
+
+	// MaxItems bounds how many participants one request may carry. Requests
+	// with more items are rejected with 400.
+	//
+	// This interacts with Limit.MaxAPIRequestBodySize (10 MiB by default): at
+	// roughly 400 bytes per item, 5000 items is about 2 MB. RAISING MaxItems
+	// WITHOUT RAISING MaxAPIRequestBodySize will make large requests fail in
+	// the body limiter instead, with a much less useful error.
+	MaxItems int `yaml:"max_items,omitempty"`
+}
+
 func (l LimitConfig) CheckRoomNameLength(name string) bool {
 	return l.MaxRoomNameLength == 0 || len(name) <= l.MaxRoomNameLength
 }
@@ -565,6 +583,10 @@ var DefaultConfig = Config{
 		SignalMessageSizeLimit:           2 << 20,  // 2 MiB
 		AgentSignalMessageSizeLimit:      2 << 20,  // 2 MiB
 		MaxAPIRequestBodySize:            10 << 20, // 10 MiB
+	},
+	Bulk: BulkConfig{
+		Workers:  0, // GOMAXPROCS
+		MaxItems: 5000,
 	},
 	Logging: LoggingConfig{
 		PionLevel: "error",
