@@ -17,7 +17,13 @@
 # This image is also the single source of truth for the Go toolchain: CI reads the
 # version out of this line (see .github/scripts/go-version.sh) so tests and images
 # always run the same runtime.
-FROM golang:1.26.6-alpine3.24@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS builder
+# --platform=$BUILDPLATFORM pins the BUILDER to the host's own architecture. The
+# build below already cross-compiles explicitly (CGO_ENABLED=0, GOOS=linux,
+# GOARCH=$TARGETARCH), so the toolchain never needs to be the target's arch —
+# and without this line a cross-arch build runs the whole Go compilation under
+# QEMU emulation, which is roughly an order of magnitude slower for an identical
+# binary. Only the final stage stays on $TARGETPLATFORM, where it belongs.
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine3.24@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS builder
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
