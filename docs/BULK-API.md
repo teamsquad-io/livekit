@@ -126,13 +126,27 @@ call does not attach the track. So:
 
 ## Failure semantics
 
-`applied` and `failed` in the response count **items, not ops**.
+`applied` and `failed` in the response count **items, not ops**. Every item
+in the request ends up in exactly one bucket — `applied` or `failed` — and
+`applied + failed` always equals the number of items in the request. An item
+is never silently dropped from the count.
 
 For each item, ops run in order and the chain **aborts at the first op that
 fails**. `opIndex` in the corresponding failure entry is the real,
 zero-based index of the op that failed inside that item's `ops` array — not
 always `0`, and not always the last index. Ops after the failing one are
 never attempted.
+
+**`opIndex: -1` means something different: the item was never attempted at
+all.** This happens when the request ends (client disconnect, or the
+server-side `bulk.timeout` below) before that item's turn came up in the
+worker pool — it never got to run any op, successful or not. Do not treat
+`-1` as "failed on the first op" (`opIndex: 0` means that); it means "this
+participant was not touched, and you should assume their state is whatever
+it was before this request." Because ops run through a bounded worker pool,
+dispatch is sequential by item index, so on a cut-short request the
+never-attempted items tend to be a contiguous run at the tail of `items`, but
+do not rely on that ordering — read `opIndex` on each failure.
 
 A failure in one item has no effect on any other item in the same request —
 each item's outcome is independent. In particular, a participant who has left
@@ -155,10 +169,13 @@ count and `failures` for (up to) the first 100 details.
 | Ops per item                | 16      | fixed (`maxBulkOpsPerItem`)       | Real traffic sends 2-3 ops per participant. This is headroom, not a tuning knob.          |
 | TrackSids per op            | 64      | fixed (`maxBulkTrackSidsPerOp`)   | A room realistically has a handful of published tracks.                                  |
 | Total ops per request       | 20000   | fixed (`maxBulkOpsPerRequest`)    | `max_items` alone does not bound total work — see below.                                 |
+| Request deadline (server-side) | 30s | `bulk.timeout`                   | Bounds the whole request from the server's side; see "Timeouts and cancellation" below.  |
 
-The three fixed limits live in `pkg/service/bulktypes.go`; `bulk.max_items`
-lives in `pkg/config/config.go` and defaults to `5000` (`bulk.workers`
-defaults to `0`, meaning `GOMAXPROCS`).
+The three fixed limits live in `pkg/service/bulktypes.go`; `bulk.max_items`,
+`bulk.workers` and `bulk.timeout` live in `pkg/config/config.go`.
+`bulk.max_items` defaults to `5000`, `bulk.workers` defaults to `0` (meaning
+`GOMAXPROCS`), and `bulk.timeout` defaults to `30s`. Setting `bulk.timeout` to
+`0` (or a negative value) disables the server-side deadline entirely.
 
 `max_items` bounds the number of *items*, but not the number of *ops*. Without
 the per-item and per-request op caps, a single item could carry roughly
@@ -195,10 +212,13 @@ the underlying RPC client's default timeout of **3 seconds**
 one op, against a room nobody had joined:
 
 ```
-INFO	livekit	service/bulkservice.go:82	bulk participants applied	{"room": "test-room", "items": 1, "applied": 0, "failed": 1, "duration": "3.005771667s"}
+INFO	livekit	service/bulkservice.go:97	bulk participants applied	{"room": "test-room", "items": 1, "applied": 0, "failed": 1, "duration": "3.005771667s", "deadlineExceeded": false}
 ```
 
-`3.005771667s` for a single item's single op.
+`3.005771667s` for a single item's single op. `deadlineExceeded` is `false`
+here because this measurement predates `bulk.timeout` even existing as a
+concept — it ran under the default 30s budget, well clear of the 3s it
+actually took.
 
 **This ~3s ceiling does not apply uniformly to every failure mode.** It is
 the RPC round-trip cost when the request actually has to reach a node over
@@ -219,27 +239,45 @@ worst case for any op, and note the ordering constraint above already means a
 
 **Consequences for a client:**
 
-- **The server does not impose its own deadline on this endpoint.** There is
-  no per-request timeout or `http.Server` read/write deadline wrapping
-  `/bulk/v1/participants` (doing so would also cut off the WebSocket signaling
-  connections served by the same mux, so it is deliberately not there). The
-  request runs for as long as it takes.
+- **The server bounds the whole request with `bulk.timeout`, default `30s`.**
+  There is no `http.Server` read/write deadline wrapping
+  `/bulk/v1/participants` (that would also cut off the WebSocket signaling
+  connections served by the same mux, so it is deliberately not there
+  either), but the handler itself wraps the request's context with
+  `context.WithTimeout(ctx, bulk.timeout)` before dispatching any item.
+  Setting `bulk.timeout` to `0` (or negative) disables this and makes the
+  server-side worst case unbounded again — the client's own HTTP timeout
+  becomes the only ceiling.
 - Items are processed by a bounded worker pool (`bulk.workers`, default
   `GOMAXPROCS`), one item's whole op chain per worker slot at a time. So the
-  **worst case for one request is roughly `(items / workers) × (ops per item)
-  × 3s`** if every op hits a dead/unreachable participant or room. For a
-  simple case of one slow op per item: 2,500 items with 10 workers is
-  `2500 / 10 = 250` batches × 3s ≈ **750 seconds, about 12.5 minutes** — for a
-  request that, in the common case where every op succeeds quickly, would
-  return in well under a second.
-- **The client must set its own HTTP timeout.** There is nothing on the
-  server side that will do it for you.
-- If the client's timeout fires and the connection is dropped, the request's
-  `context.Context` is canceled. The server stops **dispatching new items**
-  to the worker pool as soon as it observes cancellation, but items already
-  in flight on a worker are allowed to finish (there is no forceful abort of
-  an in-progress RPC). Whatever was applied before cancellation stays
-  applied — **there is no rollback**.
+  **worst case for one request, before `bulk.timeout` cuts in, is roughly
+  `(items / workers) × (ops per item) × 3s`** if every op hits a
+  dead/unreachable participant or room. For a simple case of one slow op per
+  item: 2,500 items with 10 workers is `2500 / 10 = 250` batches × 3s ≈ **750
+  seconds, about 12.5 minutes** — which is exactly why a server-side deadline
+  exists: without it, that whole 12.5 minutes is a held handler goroutine. In
+  the common case where every op succeeds quickly, the same request returns
+  in well under a second.
+- **The client should still set its own HTTP timeout** — `bulk.timeout` is
+  the server's ceiling, not a substitute for one on the client. A reasonable
+  client timeout is `bulk.timeout` plus some margin for network latency and
+  response serialization.
+- When either the client disconnects or `bulk.timeout` expires, the
+  request's `context.Context` is canceled. The server stops **dispatching
+  new items** to the worker pool as soon as it observes cancellation, but
+  items already handed to a worker are allowed to finish — there is no
+  forceful abort of an in-progress RPC (and a real RPC client that itself
+  respects context cancellation, like this server's, often returns almost
+  immediately once its context is done, rather than running to its own
+  timeout). Whatever was applied before cancellation stays applied — **there
+  is no rollback**.
+- **Every item is still accounted for when this happens — this is not
+  best-effort.** An item whose op chain ran and failed reports `failed` with
+  the real `opIndex` of the op that failed. An item that was **never
+  dispatched** because the request ended first is *also* reported as
+  `failed`, with `opIndex: -1` (see "Failure semantics" above) — it is never
+  left out of the count and never reported as `applied`. `applied + failed`
+  always equals the number of items you sent, with or without a timeout.
 - This is safe to retry because **the endpoint is idempotent**. On the
   server, `ParticipantImpl.SetPermission` has a fast path that is a no-op
   when the requested permission already matches the participant's current
@@ -247,12 +285,33 @@ worst case for any op, and note the ordering constraint above already means a
   from a track that is not currently subscribed is a no-op as well. Sending
   the exact same request again after a timeout does not double-apply
   anything.
-- **Recommendation:** size your HTTP client timeout to the batch you are
-  sending (not a fixed small number), and on timeout, do not retry
-  immediately in a loop — let the next scheduled sweep pick it up. A
-  control-plane sweep that runs every ~10 seconds and simply resends the
-  current desired state each time gets this retry behavior for free, because
-  the endpoint is idempotent.
+- **Recommendation:** size your HTTP client timeout to `bulk.timeout` plus
+  margin, and on timeout, do not retry immediately in a loop — let the next
+  scheduled sweep pick it up. A control-plane sweep that runs every ~10
+  seconds and simply resends the current desired state each time gets this
+  retry behavior for free, because the endpoint is idempotent.
+
+**Live example**, from a real run against `bulk.timeout: 1ms` (set that low
+specifically to force this path) with 50 items targeting a room with no
+active node — every op sent this way would otherwise wait out the ~3s RPC
+timeout described above:
+
+```
+INFO	livekit	service/bulkservice.go:97	bulk participants applied	{"room": "test-room", "items": 50, "applied": 0, "failed": 50, "duration": "1.769709ms", "deadlineExceeded": true}
+```
+
+The response completed in `1.77ms` instead of the ~150s a sequential 3s-per-item
+worst case would otherwise imply for 50 items. Of the 50 failures, 30 had
+`opIndex: 0` (dispatched, then failed fast because the real RPC client itself
+observed the canceled context — `"error": "request canceled"`) and 20 had
+`opIndex: -1`, e.g.:
+
+```json
+{"identity": "v_30", "opIndex": -1, "error": "not attempted: request deadline exceeded or client disconnected"}
+```
+
+`applied` was `0` and `failed` was `50` — every one of the 50 items sent was
+accounted for.
 
 ## Example
 
@@ -286,12 +345,14 @@ can build an access token with a video grant works.
 Every request logs one structured line on completion, regardless of outcome:
 
 ```
-INFO	livekit	service/bulkservice.go:82	bulk participants applied	{"room": "test-room", "items": 1, "applied": 0, "failed": 1, "duration": "3.005771667s"}
+INFO	livekit	service/bulkservice.go:97	bulk participants applied	{"room": "test-room", "items": 1, "applied": 0, "failed": 1, "duration": "3.005771667s", "deadlineExceeded": false}
 ```
 
 Fields: `room`, `items` (total items in the request), `applied`, `failed`,
 `duration` (wall time for the whole `apply` phase, after auth and
-validation).
+validation), `deadlineExceeded` (`true` when `bulk.timeout` — not a client
+disconnect — is what stopped dispatch; see "Timeouts and cancellation"
+above for a live example with `deadlineExceeded: true`).
 
 There are no new metrics for this endpoint. Per-item outcomes are recorded
 into the existing `service_operation` Prometheus counter (registered as

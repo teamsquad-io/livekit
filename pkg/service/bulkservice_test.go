@@ -477,9 +477,18 @@ func TestBulkService_StopsDispatchingOnCancel(t *testing.T) {
 	body, err := json.Marshal(req)
 	require.NoError(t, err)
 
-	doBulkCtx(ctx, bulkTestService(stub, 2), string(body), adminGrants("r1"))
+	w := doBulkCtx(ctx, bulkTestService(stub, 2), string(body), adminGrants("r1"))
 
 	require.Less(t, stub.callCount(), 500, "must not keep dispatching all 500 after cancel")
+
+	// The counters must never lose items: everything is either applied,
+	// failed, or - the case this test pins - never attempted, but it MUST be
+	// reflected as a failure. A cancelled request that reports
+	// Applied+Failed < len(items) is a silent content-access leak: the client
+	// believes items it never touched were applied and stops retrying them.
+	res := decodeBulkResponse(t, w)
+	require.Equal(t, 500, res.Applied+res.Failed, "every item must be accounted for, applied+failed+never-attempted-as-failed")
+	require.Less(t, res.Applied, 500, "cancellation must mean fewer than all 500 items were actually applied")
 }
 
 // With a pool, each worker writes only its own slot. If indices got crossed,
@@ -512,5 +521,98 @@ func TestBulkService_FailuresAreAttributedToTheRightItem(t *testing.T) {
 	for _, f := range res.Failures {
 		require.True(t, shouldFail[f.Identity], "failure attributed to %q which was not set to fail", f.Identity)
 	}
+}
+
+// If a slot never enters the dispatch queue (context cancelled before the
+// dispatch loop reaches it), it MUST be reported as a failure, never left as
+// a nil slot that compactFailures would silently count as success. OpIndex
+// -1 distinguishes "never touched" from a real op failure (opIndex 0), so a
+// client parsing failures can tell an item was never attempted at all,
+// rather than attempted-and-failed.
+//
+// The context here is cancelled BEFORE the request starts, and every hook
+// call sleeps, so the bounded dispatch queue (capacity workers*2) fills up
+// almost instantly while dispatch races ahead of the (slow) consumers. Once
+// the buffer is full, the send case of the dispatch select blocks and
+// ctx.Done() (already ready) is the only case that CAN fire, which makes
+// "many items never get dispatched" deterministic rather than a timing race.
+func TestBulkService_NotAttemptedItemsAreFailures(t *testing.T) {
+	stub := newStubUpdater()
+	stub.hook = func(string) { time.Sleep(50 * time.Millisecond) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	const n = 20
+	req := &bulkRequest{Room: "r1"}
+	for i := 0; i < n; i++ {
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: "v_" + strconv.Itoa(i),
+			Ops:      []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"T"}}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	w := doBulkCtx(ctx, bulkTestService(stub, 2), string(body), adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, n, res.Applied+res.Failed, "every item must be accounted for")
+	require.NotZero(t, res.Failed, "the pre-cancelled context must leave items undispatched")
+
+	// The last item is deep enough into the sequential dispatch order that it
+	// is effectively guaranteed to never have entered the queue.
+	lastIdentity := "v_" + strconv.Itoa(n-1)
+	var lastFailure *bulkFailure
+	for _, f := range res.Failures {
+		if f.Identity == lastIdentity {
+			lastFailure = f
+		}
+	}
+	require.NotNil(t, lastFailure, "the last item must be reported, never silently dropped from the count")
+	require.Equal(t, -1, lastFailure.OpIndex, "opIndex -1 must mean the item was never attempted")
+	require.Equal(t, ErrBulkNotAttempted.Error(), lastFailure.Error)
+}
+
+// A server-side timeout must still produce a well-formed response: every
+// item accounted for, and whatever did not finish in time reported as a
+// failure instead of silently vanishing from the count. This deliberately
+// does NOT assert how many items got through - timing under -race is not
+// something to pin a number to - only the counting invariant, so it cannot
+// be flaky on scheduling.
+func TestBulkService_TimeoutMarksUnfinishedItemsAsFailures(t *testing.T) {
+	stub := newStubUpdater()
+	stub.hook = func(string) { time.Sleep(20 * time.Millisecond) }
+
+	svc := NewBulkService(config.BulkConfig{
+		Workers:  2,
+		MaxItems: 5000,
+		Timeout:  5 * time.Millisecond, // far shorter than the 20ms per-item hook
+	}, stub)
+
+	const n = 50
+	req := &bulkRequest{Room: "r1"}
+	for i := 0; i < n; i++ {
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: "v_" + strconv.Itoa(i),
+			Ops:      []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"T"}}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	w := doBulk(t, svc, string(body), adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, n, res.Applied+res.Failed, "every item must be accounted for even when the server-side timeout fires")
+
+	foundNotAttempted := false
+	for _, f := range res.Failures {
+		if f.OpIndex == -1 {
+			foundNotAttempted = true
+			break
+		}
+	}
+	require.True(t, foundNotAttempted, "with a 5ms timeout and a 20ms-per-item stub, some items must be reported as never attempted")
 }
 

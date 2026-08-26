@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"runtime"
 	"sync"
@@ -75,16 +76,31 @@ func (s *BulkService) handleParticipants(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Bounds the whole request from the server's side. Without this, the only
+	// deadline is whatever the client sets on its HTTP call: a
+	// subscribe/unsubscribe op against a room nobody answers for waits out
+	// psrpc's 3s client timeout, and that multiplied by (items / workers) is
+	// minutes of a held handler goroutine. A Timeout of 0 disables this.
+	if s.conf.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.conf.Timeout)
+		defer cancel()
+	}
+
 	started := time.Now()
 	slots := s.apply(ctx, req.Room, items)
 	failures, failed, truncated := compactFailures(slots)
 
+	// deadlineExceeded lets this be spotted in production logs without
+	// guessing from duration alone: it is set only when OUR deadline (not the
+	// client hanging up) is what stopped dispatch.
 	utils.GetLogger(ctx).Infow("bulk participants applied",
 		"room", req.Room,
 		"items", len(items),
 		"applied", len(items)-failed,
 		"failed", failed,
 		"duration", time.Since(started),
+		"deadlineExceeded", errors.Is(ctx.Err(), context.DeadlineExceeded),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -124,10 +140,12 @@ func (s *BulkService) apply(ctx context.Context, room string, items []parsedItem
 		}()
 	}
 
+	dispatched := 0
 dispatch:
 	for i := range items {
 		select {
 		case queue <- i:
+			dispatched = i + 1
 		case <-ctx.Done():
 			// Client hung up. Stop dispatching; whatever is in flight finishes.
 			// No internal retry: the next sweep arrives in ~10s and the endpoint
@@ -137,6 +155,20 @@ dispatch:
 	}
 	close(queue)
 	wg.Wait()
+
+	// Items that never entered the queue MUST NOT be reported as applied: a
+	// nil slot means success to compactFailures, and a client that caches
+	// "applied" would stop retrying participants it never actually touched -
+	// a silent access leak in a system where this sweep decides who can see
+	// the stream. Dispatch is sequential by index, so everything from
+	// `dispatched` on was never attempted.
+	for i := dispatched; i < len(items); i++ {
+		slots[i] = &bulkFailure{
+			Identity: items[i].identity,
+			OpIndex:  -1,
+			Error:    ErrBulkNotAttempted.Error(),
+		}
+	}
 
 	return slots
 }

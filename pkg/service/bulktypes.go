@@ -48,6 +48,14 @@ var (
 	ErrBulkTooManyOps          = errors.New("too many ops for one item")
 	ErrBulkTooManyTrackSids    = errors.New("too many trackSids for one op")
 	ErrBulkTooManyOpsInRequest = errors.New("too many ops in request")
+
+	// ErrBulkNotAttempted marks an item that never entered the dispatch queue
+	// (request deadline exceeded or client disconnected before it was
+	// reached). It must NEVER be confused with a real op failure: a nil slot
+	// means success to compactFailures, so an item that was never touched
+	// MUST be turned into an explicit failure, or it silently counts as
+	// applied.
+	ErrBulkNotAttempted = errors.New("not attempted: request deadline exceeded or client disconnected")
 )
 
 // ---- wire types (what the client sends) ----

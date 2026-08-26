@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v3"
@@ -76,14 +77,16 @@ func TestBulkConfigDefaults(t *testing.T) {
 	// 0 means "use GOMAXPROCS", resolved in the service, not here.
 	require.Equal(t, 0, conf.Bulk.Workers)
 	require.Equal(t, 5000, conf.Bulk.MaxItems)
+	require.Equal(t, 30*time.Second, conf.Bulk.Timeout)
 }
 
 func TestBulkConfigFromYaml(t *testing.T) {
-	conf, err := NewConfig("bulk:\n  workers: 8\n  max_items: 100\n", true, nil, nil)
+	conf, err := NewConfig("bulk:\n  workers: 8\n  max_items: 100\n  timeout: 5s\n", true, nil, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 8, conf.Bulk.Workers)
 	require.Equal(t, 100, conf.Bulk.MaxItems)
+	require.Equal(t, 5*time.Second, conf.Bulk.Timeout)
 }
 
 func TestGeneratedFlags(t *testing.T) {

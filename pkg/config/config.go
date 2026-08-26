@@ -374,6 +374,19 @@ type BulkConfig struct {
 	// WITHOUT RAISING MaxAPIRequestBodySize will make large requests fail in
 	// the body limiter instead, with a much less useful error.
 	MaxItems int `yaml:"max_items,omitempty"`
+
+	// Timeout bounds one bulk request end to end. Without it the worst case is
+	// unbounded from the server's side: a subscribe/unsubscribe op against a
+	// room no server answers for waits out psrpc's 3s client timeout
+	// (psrpc client.go:25), and 2500 items over GOMAXPROCS workers is minutes
+	// of a held goroutine. UpdateParticipant does not pay this because it
+	// pre-checks the participant in the store (roomservice.go:281-288);
+	// UpdateSubscriptions has no such check.
+	//
+	// On expiry, dispatch stops and items already queued finish, so the real
+	// ceiling is Timeout plus one psrpc timeout. Items never dispatched are
+	// reported as failures, never as applied.
+	Timeout time.Duration `yaml:"timeout,omitempty"`
 }
 
 func (l LimitConfig) CheckRoomNameLength(name string) bool {
@@ -587,6 +600,7 @@ var DefaultConfig = Config{
 	Bulk: BulkConfig{
 		Workers:  0, // GOMAXPROCS
 		MaxItems: 5000,
+		Timeout:  30 * time.Second,
 	},
 	Logging: LoggingConfig{
 		PionLevel: "error",
