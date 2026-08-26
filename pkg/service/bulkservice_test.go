@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -394,5 +396,121 @@ func TestBulkService_FailuresAreTruncated(t *testing.T) {
 	require.Equal(t, n, res.Failed, "the failed counter must be the TRUE total, not the length of the truncated slice")
 	require.Len(t, res.Failures, maxBulkFailuresReported)
 	require.True(t, res.Truncated)
+}
+
+// ---- worker pool tests (Task 6) ----
+//
+// The unit of work is the ITEM (one participant, whole chain), not the op:
+// ops within an item stay in order (applyItem), items run in parallel with
+// each other. These tests are the criterion for correctness of the pool -
+// the Task 5 ordering/failure-isolation tests must ALSO stay green once the
+// pool lands, since that is what proves parallelism landed at the item level
+// and not the op level.
+
+// Pins that the pool ACTUALLY parallelises: the hook blocks until `workers`
+// items are inside at once. Against a sequential apply this test hangs and
+// fails on the timeout, which is the point.
+func TestBulkService_AppliesItemsConcurrently(t *testing.T) {
+	const workers = 4
+
+	stub := newStubUpdater()
+	var (
+		mu      sync.Mutex
+		inside  int
+		reached = make(chan struct{})
+		release = make(chan struct{})
+		once    sync.Once
+	)
+	stub.hook = func(string) {
+		mu.Lock()
+		inside++
+		if inside >= workers {
+			once.Do(func() { close(reached) })
+		}
+		mu.Unlock()
+		<-release
+	}
+
+	// 8 items, one cheap op each
+	req := &bulkRequest{Room: "r1"}
+	for i := 0; i < 8; i++ {
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: "v_" + strconv.Itoa(i),
+			Ops:      []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"T"}}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- doBulkCtx(context.Background(), bulkTestService(stub, workers), string(body), adminGrants("r1"))
+	}()
+
+	select {
+	case <-reached:
+		close(release)
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatalf("never had %d items in flight at once: the pool does not parallelise", workers)
+	}
+
+	res := decodeBulkResponse(t, <-done)
+	require.Equal(t, 8, res.Applied)
+	require.Equal(t, 0, res.Failed)
+}
+
+// If the client hangs up, dispatch stops. There is no internal retry: the next
+// sweep arrives in ~10s and the endpoint is idempotent.
+func TestBulkService_StopsDispatchingOnCancel(t *testing.T) {
+	stub := newStubUpdater()
+	ctx, cancel := context.WithCancel(context.Background())
+	stub.hook = func(string) { cancel() } // cancel while handling the first item
+
+	req := &bulkRequest{Room: "r1"}
+	for i := 0; i < 500; i++ {
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: "v_" + strconv.Itoa(i),
+			Ops:      []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"T"}}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	doBulkCtx(ctx, bulkTestService(stub, 2), string(body), adminGrants("r1"))
+
+	require.Less(t, stub.callCount(), 500, "must not keep dispatching all 500 after cancel")
+}
+
+// With a pool, each worker writes only its own slot. If indices got crossed,
+// failures would be attributed to the wrong participant - silently. Half the
+// items fail, and every reported failure must name an identity that really
+// was set to fail.
+func TestBulkService_FailuresAreAttributedToTheRightItem(t *testing.T) {
+	stub := newStubUpdater()
+
+	req := &bulkRequest{Room: "r1"}
+	shouldFail := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := "v_" + strconv.Itoa(i)
+		if i%2 == 0 {
+			stub.errOn[id+":"+bulkOpPermission] = ErrParticipantNotFound
+			shouldFail[id] = true
+		}
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: id,
+			Ops:      []bulkOpJSON{{Op: bulkOpPermission, Permission: json.RawMessage(`{"canSubscribe":true}`)}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	res := decodeBulkResponse(t, doBulk(t, bulkTestService(stub, 8), string(body), adminGrants("r1")))
+
+	require.Equal(t, 50, res.Failed)
+	require.Equal(t, 50, res.Applied)
+	for _, f := range res.Failures {
+		require.True(t, shouldFail[f.Identity], "failure attributed to %q which was not set to fail", f.Identity)
+	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/livekit/protocol/livekit"
@@ -95,14 +96,48 @@ func (s *BulkService) handleParticipants(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// apply runs the items sequentially. Task 6 replaces this with a worker pool;
-// the ordering tests are pinned first, on purpose, so they can catch a pool
-// that breaks the per-item ordering.
+// apply runs every item through a bounded worker pool.
+//
+// The unit of work is the ITEM — one participant with its whole chain — not the
+// op: ops within an item must stay in order (see applyItem), while items are
+// independent of each other. Parallelising at op level would break that.
+//
+// Each worker writes only to its own index in slots, so there is no shared
+// mutable state and no mutex on the hot path.
 func (s *BulkService) apply(ctx context.Context, room string, items []parsedItem) []*bulkFailure {
 	slots := make([]*bulkFailure, len(items))
-	for i, item := range items {
-		slots[i] = s.applyItem(ctx, room, item)
+
+	n := s.workers()
+	if n > len(items) {
+		n = len(items)
 	}
+	queue := make(chan int, n*2)
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			for idx := range queue {
+				slots[idx] = s.applyItem(ctx, room, items[idx])
+			}
+		}()
+	}
+
+dispatch:
+	for i := range items {
+		select {
+		case queue <- i:
+		case <-ctx.Done():
+			// Client hung up. Stop dispatching; whatever is in flight finishes.
+			// No internal retry: the next sweep arrives in ~10s and the endpoint
+			// is idempotent (MatchesPermission fast path, participant.go:851).
+			break dispatch
+		}
+	}
+	close(queue)
+	wg.Wait()
+
 	return slots
 }
 
