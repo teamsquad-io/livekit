@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -239,3 +240,159 @@ func TestBulkService_PermissionFieldsArriveIntact(t *testing.T) {
 	require.False(t, calls[0].permission.CanSubscribe)
 	require.True(t, calls[0].permission.CanPublishData)
 }
+
+func decodeBulkResponse(t *testing.T, w *httptest.ResponseRecorder) *bulkResponse {
+	t.Helper()
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var res bulkResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &res))
+	return &res
+}
+
+// ---- ordering and failure-isolation tests ----
+//
+// apply() is a plain sequential loop today. Task 6 replaces it with a queue
+// and a worker pool - concurrency is exactly what breaks per-item op order if
+// the pool is wrong. These tests are written and pinned NOW, against the
+// sequential implementation, on purpose: they are the net that catches Task 6
+// breaking the invariant, not a test suite shaped after the pool's behavior.
+
+// The op order inside an item is a correctness invariant: with
+// canSubscribe:false a subscribe does not attach (see the note in
+// applyItem/participant.go), so a re-grant must set the permission BEFORE
+// subscribing, and a deny must unsubscribe BEFORE pinning canSubscribe:false.
+func TestBulkService_PreservesOpOrderWithinItem(t *testing.T) {
+	stub := newStubUpdater()
+	body := `{"room":"r1","items":[
+		{"identity":"v_regrant","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a","TR_b"]}
+		]},
+		{"identity":"v_deny","ops":[
+			{"op":"unsubscribe","trackSids":["TR_a","TR_b"]},
+			{"op":"permission","permission":{"canSubscribe":false}}
+		]}
+	]}`
+	w := doBulk(t, bulkTestService(stub, 2), body, adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, 2, res.Applied)
+	require.Equal(t, 0, res.Failed)
+
+	regrant := stub.callsFor("v_regrant")
+	require.Len(t, regrant, 2)
+	require.Equal(t, bulkOpPermission, regrant[0].kind, "re-grant: permission must be set before subscribe")
+	require.Equal(t, bulkOpSubscribe, regrant[1].kind)
+
+	deny := stub.callsFor("v_deny")
+	require.Len(t, deny, 2)
+	require.Equal(t, bulkOpUnsubscribe, deny[0].kind, "deny: unsubscribe must happen before the permission is pinned")
+	require.Equal(t, bulkOpPermission, deny[1].kind)
+}
+
+func TestBulkService_FailureAbortsOnlyThatChain(t *testing.T) {
+	stub := newStubUpdater()
+	stub.errOn["v_gone:"+bulkOpPermission] = ErrParticipantNotFound
+
+	body := `{"room":"r1","items":[
+		{"identity":"v_ok","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a"]}
+		]},
+		{"identity":"v_gone","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a"]}
+		]}
+	]}`
+	w := doBulk(t, bulkTestService(stub, 2), body, adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, 1, res.Applied)
+	require.Equal(t, 1, res.Failed)
+	require.False(t, res.Truncated)
+	require.Len(t, res.Failures, 1)
+	require.Equal(t, "v_gone", res.Failures[0].Identity)
+	require.Equal(t, 0, res.Failures[0].OpIndex)
+
+	require.Len(t, stub.callsFor("v_gone"), 1, "the chain must stop at the first failure; subscribe must not be attempted")
+	require.Len(t, stub.callsFor("v_ok"), 2, "one viewer's failure must not affect another viewer in the same request")
+}
+
+// This variant pins that OpIndex is the REAL index of the failing op, not
+// always 0 and not the last index - a failure in the middle of a three-op
+// chain must report index 1 and must not run op index 2.
+func TestBulkService_FailureMidChainAbortsRest(t *testing.T) {
+	stub := newStubUpdater()
+	stub.errOn["v_1:"+bulkOpSubscribe] = ErrParticipantNotFound
+
+	body := `{"room":"r1","items":[
+		{"identity":"v_1","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a"]},
+			{"op":"unsubscribe","trackSids":["TR_b"]}
+		]}
+	]}`
+	w := doBulk(t, bulkTestService(stub, 2), body, adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, 0, res.Applied)
+	require.Equal(t, 1, res.Failed)
+	require.Len(t, res.Failures, 1)
+	require.Equal(t, 1, res.Failures[0].OpIndex, "opIndex must be the real index of the failing op, not 0 or the last")
+
+	calls := stub.callsFor("v_1")
+	require.Len(t, calls, 2, "the first two ops ran; the third op must not have been attempted")
+	require.Equal(t, bulkOpPermission, calls[0].kind)
+	require.Equal(t, bulkOpSubscribe, calls[1].kind)
+}
+
+// Real idempotency in production comes from the fast-path in
+// participant.SetPermission / MatchesPermission (pkg/rtc/participant.go:851):
+// re-applying the same permission there is a no-op. What THIS test pins is
+// narrower and just as necessary: the HANDLER itself must not carry state
+// between requests, so sending the same request twice produces the same
+// result twice rather than, say, a change on the second call because
+// something was cached from the first.
+func TestBulkService_IsIdempotent(t *testing.T) {
+	stub := newStubUpdater()
+	svc := bulkTestService(stub, 2)
+
+	w1 := doBulk(t, svc, oneItemBody, adminGrants("r1"))
+	res1 := decodeBulkResponse(t, w1)
+	require.Equal(t, 1, res1.Applied)
+	require.Equal(t, 0, res1.Failed)
+
+	w2 := doBulk(t, svc, oneItemBody, adminGrants("r1"))
+	res2 := decodeBulkResponse(t, w2)
+	require.Equal(t, 1, res2.Applied)
+	require.Equal(t, 0, res2.Failed)
+
+	require.Equal(t, 2, stub.callCount(), "the same request applied twice must produce twice the calls, not be deduped by the handler")
+}
+
+// The failures slice is bounded by maxBulkFailuresReported, but the Failed
+// counter must keep reporting the TRUE total so a client cannot be lied to
+// about how much of a sweep actually broke.
+func TestBulkService_FailuresAreTruncated(t *testing.T) {
+	stub := newStubUpdater()
+	n := maxBulkFailuresReported + 10
+
+	items := make([]bulkItemJSON, n)
+	for i := range items {
+		identity := fmt.Sprintf("v_%d", i)
+		items[i] = bulkItemJSON{Identity: identity, Ops: []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"TR_a"}}}}
+		stub.errOn[identity+":"+bulkOpSubscribe] = ErrParticipantNotFound
+	}
+	req := &bulkRequest{Room: "r1", Items: items}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	w := doBulk(t, bulkTestService(stub, 2), string(body), adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, 0, res.Applied)
+	require.Equal(t, n, res.Failed, "the failed counter must be the TRUE total, not the length of the truncated slice")
+	require.Len(t, res.Failures, maxBulkFailuresReported)
+	require.True(t, res.Truncated)
+}
+
