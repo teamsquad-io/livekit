@@ -19,6 +19,22 @@ const (
 	// sweep where every one of max_items participants failed cannot produce a
 	// multi-megabyte body. The counters still report the true totals.
 	maxBulkFailuresReported = 100
+
+	// Real traffic sends 2-3 ops per participant (a re-grant is
+	// permission+subscribe; a deny is unsubscribe+permission), so these caps
+	// are generous headroom, not a tuning knob. They exist because MaxItems
+	// alone does NOT bound the work: without them a single item can carry
+	// ~270k ops inside the 10 MiB body limit, and one authenticated request
+	// then occupies a handler goroutine for hundreds of thousands of
+	// sequential RPCs.
+	maxBulkOpsPerItem = 16
+	// A room carries a handful of published tracks; 64 is far above any real
+	// fan-out and still bounds a single op.
+	maxBulkTrackSidsPerOp = 64
+	// Bounds the TOTAL work of one request. maxBulkOpsPerItem alone does not:
+	// MaxItems(5000) x 16 would still be 80k ops. Real worst case is ~2500
+	// participants x 3 ops = 7500.
+	maxBulkOpsPerRequest = 20000
 )
 
 var (
@@ -28,6 +44,10 @@ var (
 	ErrBulkOpsRequired        = errors.New("ops must not be empty")
 	ErrBulkTrackSidsRequired  = errors.New("trackSids must not be empty")
 	ErrBulkPermissionRequired = errors.New("permission is required")
+
+	ErrBulkTooManyOps          = errors.New("too many ops for one item")
+	ErrBulkTooManyTrackSids    = errors.New("too many trackSids for one op")
+	ErrBulkTooManyOpsInRequest = errors.New("too many ops in request")
 )
 
 // ---- wire types (what the client sends) ----
@@ -95,10 +115,18 @@ func parseBulkRequest(req *bulkRequest, maxItems int) ([]parsedItem, error) {
 	}
 
 	items := make([]parsedItem, 0, len(req.Items))
+	totalOps := 0
 	for i, raw := range req.Items {
 		item, err := parseBulkItem(raw)
 		if err != nil {
 			return nil, fmt.Errorf("items[%d]: %w", i, err)
+		}
+		// Checked inside the loop, against the running total, so an abusive
+		// request is cut off early instead of building the full item list
+		// first.
+		totalOps += len(item.ops)
+		if totalOps > maxBulkOpsPerRequest {
+			return nil, ErrBulkTooManyOpsInRequest
 		}
 		items = append(items, item)
 	}
@@ -111,6 +139,9 @@ func parseBulkItem(raw bulkItemJSON) (parsedItem, error) {
 	}
 	if len(raw.Ops) == 0 {
 		return parsedItem{}, ErrBulkOpsRequired
+	}
+	if len(raw.Ops) > maxBulkOpsPerItem {
+		return parsedItem{}, ErrBulkTooManyOps
 	}
 
 	ops := make([]parsedOp, 0, len(raw.Ops))
@@ -139,6 +170,9 @@ func parseBulkOp(raw bulkOpJSON) (parsedOp, error) {
 	case bulkOpSubscribe, bulkOpUnsubscribe:
 		if len(raw.TrackSids) == 0 {
 			return parsedOp{}, ErrBulkTrackSidsRequired
+		}
+		if len(raw.TrackSids) > maxBulkTrackSidsPerOp {
+			return parsedOp{}, ErrBulkTooManyTrackSids
 		}
 		return parsedOp{kind: raw.Op, trackSids: raw.TrackSids}, nil
 

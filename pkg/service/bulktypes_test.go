@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -85,6 +86,73 @@ func TestParseBulkRequest_MaxItems(t *testing.T) {
 	items, err := parseBulkRequest(req, 0)
 	require.NoError(t, err)
 	require.Len(t, items, 2)
+}
+
+// ---- op/trackSid/request caps ----
+//
+// MaxItems alone does not bound the work of a request: without these caps a
+// single item can carry ~270k ops inside the 10 MiB body limit, occupying a
+// handler goroutine for hundreds of thousands of sequential RPCs. These tests
+// build the oversized payloads by code, not by hand.
+
+func opsOf(n int) []bulkOpJSON {
+	ops := make([]bulkOpJSON, n)
+	for i := range ops {
+		ops[i] = bulkOpJSON{Op: bulkOpSubscribe, TrackSids: []string{"T"}}
+	}
+	return ops
+}
+
+func TestParseBulkRequest_TooManyOpsInItem(t *testing.T) {
+	req := &bulkRequest{Room: "r1", Items: []bulkItemJSON{
+		{Identity: "v_1", Ops: opsOf(maxBulkOpsPerItem + 1)},
+	}}
+
+	items, err := parseBulkRequest(req, 0)
+	require.ErrorIs(t, err, ErrBulkTooManyOps)
+	require.Nil(t, items)
+}
+
+// The limit is inclusive: exactly maxBulkOpsPerItem ops must be accepted.
+func TestParseBulkRequest_MaxOpsPerItemIsInclusive(t *testing.T) {
+	req := &bulkRequest{Room: "r1", Items: []bulkItemJSON{
+		{Identity: "v_1", Ops: opsOf(maxBulkOpsPerItem)},
+	}}
+
+	items, err := parseBulkRequest(req, 0)
+	require.NoError(t, err)
+	require.Len(t, items[0].ops, maxBulkOpsPerItem)
+}
+
+func TestParseBulkRequest_TooManyTrackSids(t *testing.T) {
+	sids := make([]string, maxBulkTrackSidsPerOp+1)
+	for i := range sids {
+		sids[i] = fmt.Sprintf("T%d", i)
+	}
+	req := &bulkRequest{Room: "r1", Items: []bulkItemJSON{
+		{Identity: "v_1", Ops: []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: sids}}},
+	}}
+
+	items, err := parseBulkRequest(req, 0)
+	require.ErrorIs(t, err, ErrBulkTooManyTrackSids)
+	require.Nil(t, items)
+}
+
+// Enough items x ops to cross maxBulkOpsPerRequest, with each item staying
+// within maxBulkOpsPerItem so only the request-wide cap is exercised.
+func TestParseBulkRequest_TooManyOpsInRequest(t *testing.T) {
+	itemCount := maxBulkOpsPerRequest/maxBulkOpsPerItem + 10
+	items := make([]bulkItemJSON, itemCount)
+	for i := range items {
+		items[i] = bulkItemJSON{Identity: fmt.Sprintf("v_%d", i), Ops: opsOf(maxBulkOpsPerItem)}
+	}
+	req := &bulkRequest{Room: "r1", Items: items}
+
+	// maxItems disabled (0): we're exercising the ops-in-request cap here, not
+	// the item cap.
+	parsed, err := parseBulkRequest(req, 0)
+	require.ErrorIs(t, err, ErrBulkTooManyOpsInRequest)
+	require.Nil(t, parsed)
 }
 
 func TestCompactFailures(t *testing.T) {
