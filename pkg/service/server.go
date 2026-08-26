@@ -149,6 +149,7 @@ func NewLivekitServer(conf *config.Config,
 	xtwirp.RegisterServer(mux, sipServer)
 	rtcService.SetupRoutes(mux)
 	whipService.SetupRoutes(mux)
+	NewBulkService(conf.Bulk, roomService).SetupRoutes(mux)
 	mux.Handle("/agent", agentService)
 	mux.HandleFunc("/", s.defaultHandler)
 
