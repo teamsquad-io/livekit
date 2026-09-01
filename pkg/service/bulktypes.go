@@ -56,6 +56,18 @@ var (
 	// MUST be turned into an explicit failure, or it silently counts as
 	// applied.
 	ErrBulkNotAttempted = errors.New("not attempted: request deadline exceeded or client disconnected")
+
+	// ErrBulkOpDeadlineExceeded marks an op cut by BulkConfig.OpTimeout - OUR
+	// per-op deadline - rather than by an error coming back from the
+	// RoomService. It is wrapped into the reported failure so the two are
+	// distinguishable in `failures[].error`: that is the whole point of the
+	// knob, since counting these is how you find out how many ops are waiting
+	// on a participant no node answers for.
+	//
+	// It is a FAILURE like any other. An op that ran out of time was NOT
+	// applied, and reporting it as anything softer would silently count it as
+	// applied - the same access leak ErrBulkNotAttempted exists to prevent.
+	ErrBulkOpDeadlineExceeded = errors.New("op deadline exceeded")
 )
 
 // ---- wire types (what the client sends) ----

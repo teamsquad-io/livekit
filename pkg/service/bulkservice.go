@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"runtime"
 	"sync"
@@ -188,7 +189,37 @@ func (s *BulkService) applyItem(ctx context.Context, room string, item parsedIte
 	return nil
 }
 
+// applyOp gives ONE op its own deadline, derived from the request context, and
+// labels the failure when that deadline - and not the RoomService - is what
+// ended the call.
+//
+// Deriving from ctx (rather than context.Background) is deliberate: a client
+// that hangs up, and the request-wide s.conf.Timeout, must still cancel work in
+// flight. This only puts a tighter ceiling on top.
 func (s *BulkService) applyOp(ctx context.Context, room, identity string, op parsedOp) error {
+	if s.conf.OpTimeout <= 0 {
+		return s.dispatchOp(ctx, room, identity, op)
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, s.conf.OpTimeout)
+	defer cancel()
+
+	err := s.dispatchOp(opCtx, room, identity, op)
+	if err == nil {
+		return nil
+	}
+	// ctx.Err() == nil is what separates OUR deadline from the request's: a
+	// cancelled or expired PARENT also makes opCtx.Err() non-nil, and that is
+	// not this. (A parent expiring in the window between the two reads would
+	// mislabel one op; it is a failure either way, and the alternative -
+	// comparing deadlines - buys nothing.)
+	if ctx.Err() == nil && errors.Is(opCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w after %s: %w", ErrBulkOpDeadlineExceeded, s.conf.OpTimeout, err)
+	}
+	return err
+}
+
+func (s *BulkService) dispatchOp(ctx context.Context, room, identity string, op parsedOp) error {
 	if op.kind == bulkOpPermission {
 		// Name/Metadata/Attributes are left zero ON PURPOSE: participant.go
 		// :740-748 applies them only when non-empty, so this updates the
