@@ -78,15 +78,31 @@ func TestBulkConfigDefaults(t *testing.T) {
 	require.Equal(t, 0, conf.Bulk.Workers)
 	require.Equal(t, 5000, conf.Bulk.MaxItems)
 	require.Equal(t, 30*time.Second, conf.Bulk.Timeout)
+	// Per-op deadline. Three orders of magnitude above a healthy op (a whole
+	// healthy bulk request measures 350-575us) and well under psrpc's 3s,
+	// which is what it replaces.
+	require.Equal(t, 500*time.Millisecond, conf.Bulk.OpTimeout)
 }
 
 func TestBulkConfigFromYaml(t *testing.T) {
-	conf, err := NewConfig("bulk:\n  workers: 8\n  max_items: 100\n  timeout: 5s\n", true, nil, nil)
+	conf, err := NewConfig("bulk:\n  workers: 8\n  max_items: 100\n  timeout: 5s\n  op_timeout: 250ms\n", true, nil, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 8, conf.Bulk.Workers)
 	require.Equal(t, 100, conf.Bulk.MaxItems)
 	require.Equal(t, 5*time.Second, conf.Bulk.Timeout)
+	require.Equal(t, 250*time.Millisecond, conf.Bulk.OpTimeout)
+}
+
+// 0 must DISABLE the per-op deadline, not fall back to the default. Same
+// convention as bulk.timeout, and the difference matters: this is the
+// first-line rollback for the knob, so an operator setting it to 0 must get
+// the old psrpc-3s behaviour back and not silently keep the default.
+func TestBulkConfigOpTimeoutZeroDisables(t *testing.T) {
+	conf, err := NewConfig("bulk:\n  op_timeout: 0s\n", true, nil, nil)
+	require.NoError(t, err)
+
+	require.Equal(t, time.Duration(0), conf.Bulk.OpTimeout)
 }
 
 func TestGeneratedFlags(t *testing.T) {

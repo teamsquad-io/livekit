@@ -36,23 +36,41 @@ type stubUpdater struct {
 
 	// errOn returns an error when the key "identity:kind" matches.
 	errOn map[string]error
+	// stallOn blocks the call until its context is done, then returns that
+	// context's error, for the key "identity:kind". This models psrpc, which
+	// is what the per-op deadline exists for: an op nobody serves produces no
+	// connection error, it waits out the timer and comes back with the
+	// context's error (psrpc client.go:157-164, ErrRequestTimedOut /
+	// ErrRequestCanceled). A stub that ignored the context could not tell a
+	// working deadline from a broken one.
+	stallOn map[string]bool
 	// hook runs (outside the mutex) before recording, for the concurrency and
 	// cancellation tests in later tasks.
 	hook func(identity string)
 }
 
 func newStubUpdater() *stubUpdater {
-	return &stubUpdater{errOn: map[string]error{}}
+	return &stubUpdater{errOn: map[string]error{}, stallOn: map[string]bool{}}
 }
 
-func (s *stubUpdater) record(kind, room, identity string, sids []string, permission *livekit.ParticipantPermission) error {
+func (s *stubUpdater) record(ctx context.Context, kind, room, identity string, sids []string, permission *livekit.ParticipantPermission) error {
 	if s.hook != nil {
 		s.hook(identity)
 	}
+	// The lock is released BEFORE a stalling call blocks: holding it would
+	// wedge every other worker and turn a per-op stall into a whole-request
+	// one, which is the opposite of what these tests measure.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.calls = append(s.calls, recordedCall{kind: kind, room: room, identity: identity, trackSids: sids, permission: permission})
-	return s.errOn[identity+":"+kind]
+	key := identity + ":" + kind
+	stall, err := s.stallOn[key], s.errOn[key]
+	s.mu.Unlock()
+
+	if stall {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return err
 }
 
 func (s *stubUpdater) callsFor(identity string) []recordedCall {
@@ -73,19 +91,19 @@ func (s *stubUpdater) callCount() int {
 	return len(s.calls)
 }
 
-func (s *stubUpdater) UpdateParticipant(_ context.Context, req *livekit.UpdateParticipantRequest) (*livekit.ParticipantInfo, error) {
-	if err := s.record(bulkOpPermission, req.Room, req.Identity, nil, req.Permission); err != nil {
+func (s *stubUpdater) UpdateParticipant(ctx context.Context, req *livekit.UpdateParticipantRequest) (*livekit.ParticipantInfo, error) {
+	if err := s.record(ctx, bulkOpPermission, req.Room, req.Identity, nil, req.Permission); err != nil {
 		return nil, err
 	}
 	return &livekit.ParticipantInfo{Identity: req.Identity}, nil
 }
 
-func (s *stubUpdater) UpdateSubscriptions(_ context.Context, req *livekit.UpdateSubscriptionsRequest) (*livekit.UpdateSubscriptionsResponse, error) {
+func (s *stubUpdater) UpdateSubscriptions(ctx context.Context, req *livekit.UpdateSubscriptionsRequest) (*livekit.UpdateSubscriptionsResponse, error) {
 	kind := bulkOpUnsubscribe
 	if req.Subscribe {
 		kind = bulkOpSubscribe
 	}
-	if err := s.record(kind, req.Room, req.Identity, req.TrackSids, nil); err != nil {
+	if err := s.record(ctx, kind, req.Room, req.Identity, req.TrackSids, nil); err != nil {
 		return nil, err
 	}
 	return &livekit.UpdateSubscriptionsResponse{}, nil
@@ -616,3 +634,148 @@ func TestBulkService_TimeoutMarksUnfinishedItemsAsFailures(t *testing.T) {
 	require.True(t, foundNotAttempted, "with a 5ms timeout and a 20ms-per-item stub, some items must be reported as never attempted")
 }
 
+// ---- per-op deadline (BulkConfig.OpTimeout) ----
+
+// bulkTestServiceOpTimeout builds a service with NO request-wide deadline, so
+// the ONLY thing that can end a stalled op is OpTimeout. That is what makes
+// these tests a real gate rather than a coincidence: with a broken per-op
+// deadline the stub blocks on a context that never fires, and the test hangs
+// until the package timeout instead of quietly passing.
+func bulkTestServiceOpTimeout(s *stubUpdater, workers int, opTimeout time.Duration) *BulkService {
+	return NewBulkService(config.BulkConfig{Workers: workers, MaxItems: 5000, OpTimeout: opTimeout}, s)
+}
+
+// An op cut by OUR deadline is a FAILURE, reported in failures[], and it says
+// so: the error wraps ErrBulkOpDeadlineExceeded, which is how a stalled op is
+// told apart from an error the RoomService actually returned. Reporting it as
+// anything softer would count it as applied - the access leak 276b4497 exists
+// to prevent.
+func TestBulkService_OpDeadlineIsReportedAsAFailure(t *testing.T) {
+	stub := newStubUpdater()
+	stub.stallOn["v_stalled:"+bulkOpSubscribe] = true
+
+	body := `{"room":"r1","items":[
+		{"identity":"v_ok","ops":[{"op":"subscribe","trackSids":["TR_a"]}]},
+		{"identity":"v_stalled","ops":[{"op":"subscribe","trackSids":["TR_a"]}]}
+	]}`
+
+	res := decodeBulkResponse(t, doBulk(t, bulkTestServiceOpTimeout(stub, 2, 20*time.Millisecond), body, adminGrants("r1")))
+
+	require.Equal(t, 1, res.Applied)
+	require.Equal(t, 1, res.Failed)
+	require.Len(t, res.Failures, 1)
+	require.Equal(t, "v_stalled", res.Failures[0].Identity)
+	// opIndex 0, NOT -1: the op was attempted and timed out. -1 means the item
+	// never entered the dispatch queue, which is a different thing entirely.
+	require.Equal(t, 0, res.Failures[0].OpIndex)
+	require.Contains(t, res.Failures[0].Error, ErrBulkOpDeadlineExceeded.Error(),
+		"the failure must name OUR deadline, or there is no way to count these in production")
+}
+
+// The point of the knob: one participant nobody answers for costs OpTimeout,
+// not psrpc's 3s, and it does not stop the other items from being applied.
+func TestBulkService_OpDeadlineDoesNotStallTheOtherItems(t *testing.T) {
+	stub := newStubUpdater()
+	stub.stallOn["v_3:"+bulkOpSubscribe] = true
+
+	req := &bulkRequest{Room: "r1"}
+	for i := 0; i < 10; i++ {
+		req.Items = append(req.Items, bulkItemJSON{
+			Identity: "v_" + strconv.Itoa(i),
+			Ops:      []bulkOpJSON{{Op: bulkOpSubscribe, TrackSids: []string{"TR_a"}}},
+		})
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	res := decodeBulkResponse(t, doBulk(t, bulkTestServiceOpTimeout(stub, 4, 20*time.Millisecond), string(body), adminGrants("r1")))
+
+	require.Equal(t, 9, res.Applied)
+	require.Equal(t, 1, res.Failed)
+	require.Equal(t, 10, res.Applied+res.Failed, "every item accounted for")
+}
+
+// A timed-out op aborts the REST OF ITS OWN CHAIN and nothing else - the same
+// rule applyItem already enforces for a returned error. Continuing after a
+// subscribe that never landed would report ops as applied on top of a state
+// that was never reached.
+func TestBulkService_OpDeadlineAbortsOnlyItsOwnChain(t *testing.T) {
+	stub := newStubUpdater()
+	stub.stallOn["v_stalled:"+bulkOpPermission] = true
+
+	body := `{"room":"r1","items":[
+		{"identity":"v_stalled","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a"]}
+		]},
+		{"identity":"v_ok","ops":[
+			{"op":"permission","permission":{"canSubscribe":true}},
+			{"op":"subscribe","trackSids":["TR_a"]}
+		]}
+	]}`
+
+	res := decodeBulkResponse(t, doBulk(t, bulkTestServiceOpTimeout(stub, 2, 20*time.Millisecond), body, adminGrants("r1")))
+
+	require.Equal(t, 1, res.Applied)
+	require.Equal(t, 1, res.Failed)
+
+	stalled := stub.callsFor("v_stalled")
+	require.Len(t, stalled, 1, "the chain must stop at the op that timed out")
+	require.Equal(t, bulkOpPermission, stalled[0].kind)
+
+	require.Len(t, stub.callsFor("v_ok"), 2, "the other item's chain must run whole")
+}
+
+// OpTimeout <= 0 disables the per-op deadline, same convention as Timeout.
+// Verified through a path that CANNOT pass by accident: with the deadline off
+// the only thing left to end the stalled op is the request-wide Timeout, so
+// the failure must be the plain context error and must NOT be labelled as
+// ours. If applyOp labelled indiscriminately, this fails.
+func TestBulkService_OpDeadlineDisabledLeavesTheOpToTheRequestTimeout(t *testing.T) {
+	stub := newStubUpdater()
+	stub.stallOn["v_stalled:"+bulkOpSubscribe] = true
+
+	svc := NewBulkService(config.BulkConfig{
+		Workers:   2,
+		MaxItems:  5000,
+		Timeout:   30 * time.Millisecond,
+		OpTimeout: 0, // disabled
+	}, stub)
+
+	body := `{"room":"r1","items":[{"identity":"v_stalled","ops":[{"op":"subscribe","trackSids":["TR_a"]}]}]}`
+	res := decodeBulkResponse(t, doBulk(t, svc, body, adminGrants("r1")))
+
+	require.Equal(t, 1, res.Failed)
+	require.Len(t, res.Failures, 1)
+	require.NotContains(t, res.Failures[0].Error, ErrBulkOpDeadlineExceeded.Error(),
+		"with OpTimeout disabled nothing may be attributed to a per-op deadline")
+}
+
+// A parent that dies (client hangup, request-wide Timeout) must NOT be
+// mislabelled as our per-op deadline: the label is what will be counted in
+// production to size the knob, and a label that also fires on client hangups
+// would count the wrong population. OpTimeout here is 10s - orders of
+// magnitude away from firing - so anything labelled would be a bug.
+func TestBulkService_ClientCancelIsNotLabelledAsAnOpDeadline(t *testing.T) {
+	stub := newStubUpdater()
+	stub.stallOn["v_stalled:"+bulkOpSubscribe] = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stub.hook = func(identity string) {
+		if identity == "v_stalled" {
+			// Cancel from a goroutine: hook runs BEFORE the stall, so
+			// cancelling inline would still work, but this also covers the
+			// ordering where the op is already blocked.
+			go cancel()
+		}
+	}
+
+	body := `{"room":"r1","items":[{"identity":"v_stalled","ops":[{"op":"subscribe","trackSids":["TR_a"]}]}]}`
+	w := doBulkCtx(ctx, bulkTestServiceOpTimeout(stub, 2, 10*time.Second), body, adminGrants("r1"))
+	res := decodeBulkResponse(t, w)
+
+	require.Equal(t, 1, res.Failed)
+	require.Len(t, res.Failures, 1)
+	require.NotContains(t, res.Failures[0].Error, ErrBulkOpDeadlineExceeded.Error(),
+		"a cancelled client is not a per-op deadline")
+}

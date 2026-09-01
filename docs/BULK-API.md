@@ -148,6 +148,14 @@ dispatch is sequential by item index, so on a cut-short request the
 never-attempted items tend to be a contiguous run at the tail of `items`, but
 do not rely on that ordering — read `opIndex` on each failure.
 
+**An op cut by the per-op deadline (`bulk.op_timeout`) is a normal failure**,
+with the real `opIndex` of the op that ran out of time, and its `error` string
+is prefixed with `op deadline exceeded after <duration>:` so it can be told
+apart from an error the room service actually returned. Counting these is how
+you find out how many ops are waiting on a participant no node answers for.
+The rest of that item's chain is not attempted, exactly as with any other
+failure.
+
 A failure in one item has no effect on any other item in the same request —
 each item's outcome is independent. In particular, a participant who has left
 the room (or never joined) produces a `failed` item, not a `400` for the
@@ -170,12 +178,16 @@ count and `failures` for (up to) the first 100 details.
 | TrackSids per op            | 64      | fixed (`maxBulkTrackSidsPerOp`)   | A room realistically has a handful of published tracks.                                  |
 | Total ops per request       | 20000   | fixed (`maxBulkOpsPerRequest`)    | `max_items` alone does not bound total work — see below.                                 |
 | Request deadline (server-side) | 30s | `bulk.timeout`                   | Bounds the whole request from the server's side; see "Timeouts and cancellation" below.  |
+| Per-op deadline            | 500ms   | `bulk.op_timeout`                | Bounds ONE op instead of letting it inherit psrpc's 3s; see "Timeouts and cancellation". |
 
 The three fixed limits live in `pkg/service/bulktypes.go`; `bulk.max_items`,
-`bulk.workers` and `bulk.timeout` live in `pkg/config/config.go`.
-`bulk.max_items` defaults to `5000`, `bulk.workers` defaults to `0` (meaning
-`GOMAXPROCS`), and `bulk.timeout` defaults to `30s`. Setting `bulk.timeout` to
-`0` (or a negative value) disables the server-side deadline entirely.
+`bulk.workers`, `bulk.timeout` and `bulk.op_timeout` live in
+`pkg/config/config.go`. `bulk.max_items` defaults to `5000`, `bulk.workers`
+defaults to `0` (meaning `GOMAXPROCS`), `bulk.timeout` defaults to `30s` and
+`bulk.op_timeout` defaults to `500ms`. Setting `bulk.timeout` to `0` (or a
+negative value) disables the server-side request deadline entirely; setting
+`bulk.op_timeout` to `0` disables the per-op one and restores the psrpc 3s
+behaviour.
 
 `max_items` bounds the number of *items*, but not the number of *ops*. Without
 the per-item and per-request op caps, a single item could carry roughly
@@ -248,16 +260,27 @@ worst case for any op, and note the ordering constraint above already means a
   Setting `bulk.timeout` to `0` (or negative) disables this and makes the
   server-side worst case unbounded again — the client's own HTTP timeout
   becomes the only ceiling.
+- **The server also bounds each individual op with `bulk.op_timeout`, default
+  `500ms`.** Each op runs with its own context, derived from the request's (so
+  a client hangup and `bulk.timeout` still cancel everything) but with a much
+  tighter ceiling. This is the direct answer to the ~3s above: an op that
+  nobody is going to answer fails in 500ms instead of waiting out
+  `psrpc.DefaultClientTimeout`. It is sized against measurement, not intuition
+  — a bulk request in which nothing fails costs 350–575µs *end to end*, so a
+  healthy op is tens of microseconds and 500ms is about three orders of
+  magnitude of headroom. Do not tighten it casually: an op cut this way is a
+  **real failure**, so a deadline near real op latency would manufacture
+  failures out of a GC pause or a bus blip. Set it to `0` to disable.
 - Items are processed by a bounded worker pool (`bulk.workers`, default
   `GOMAXPROCS`), one item's whole op chain per worker slot at a time. So the
   **worst case for one request, before `bulk.timeout` cuts in, is roughly
-  `(items / workers) × (ops per item) × 3s`** if every op hits a
-  dead/unreachable participant or room. For a simple case of one slow op per
-  item: 2,500 items with 10 workers is `2500 / 10 = 250` batches × 3s ≈ **750
-  seconds, about 12.5 minutes** — which is exactly why a server-side deadline
-  exists: without it, that whole 12.5 minutes is a held handler goroutine. In
-  the common case where every op succeeds quickly, the same request returns
-  in well under a second.
+  `(items / workers) × (ops per item) × bulk.op_timeout`** if every op hits a
+  dead/unreachable participant or room (with `bulk.op_timeout` disabled, read
+  `3s` in its place). For a simple case of one slow op per item: 2,500 items
+  with 10 workers is `2500 / 10 = 250` batches; at the 500ms default that is
+  **125 seconds**, and at the psrpc 3s it was **750 seconds, about 12.5
+  minutes** — which is why both deadlines exist. In the common case where
+  every op succeeds quickly, the same request returns in well under a second.
 - **The client should still set its own HTTP timeout** — `bulk.timeout` is
   the server's ceiling, not a substitute for one on the client. A reasonable
   client timeout is `bulk.timeout` plus some margin for network latency and

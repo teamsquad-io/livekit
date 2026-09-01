@@ -384,9 +384,36 @@ type BulkConfig struct {
 	// UpdateSubscriptions has no such check.
 	//
 	// On expiry, dispatch stops and items already queued finish, so the real
-	// ceiling is Timeout plus one psrpc timeout. Items never dispatched are
-	// reported as failures, never as applied.
+	// ceiling is Timeout plus one OpTimeout (or, with OpTimeout disabled, one
+	// psrpc timeout). Items never dispatched are reported as failures, never
+	// as applied.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
+
+	// OpTimeout bounds ONE op (one UpdateParticipant / UpdateSubscriptions),
+	// not the request. Without it every op inherits psrpc's 3s client timeout
+	// (psrpc client.go:25), which is what an op nobody answers for actually
+	// costs: psrpc is RPC over a bus, so an unserved topic produces no
+	// connection error - it waits out the timer. Measured in production on
+	// 2026-08-31: a bulk request with zero failures costs 350-575us end to
+	// end, while a request with ANY failure costs 3.000-3.005s, and 1 failure
+	// costs the same as 3 because the worker pool waits them out in parallel.
+	//
+	// The deadline is derived from the request context, so a client that hangs
+	// up still cancels everything; it only puts a tighter ceiling on each op.
+	//
+	// SIZING. A healthy op is tens of microseconds (see the whole-request
+	// figure above), so 500ms is about three orders of magnitude of headroom -
+	// it cannot cut a healthy op. It is deliberately NOT tighter than that:
+	// an op cut by this deadline is reported as a REAL FAILURE, the caller
+	// does not converge that participant, and the work is redone on its next
+	// sweep. That is the correct trade at 500ms (an op that slow is not going
+	// to be answered) and a bad one at, say, 20ms, where a GC pause or a Redis
+	// blip on the target node would manufacture failures out of transient
+	// slowness. Tighten it only against measured op latency, not by intuition.
+	//
+	// A value of 0 (or negative) disables it and restores the psrpc 3s
+	// behaviour, same convention as Timeout.
+	OpTimeout time.Duration `yaml:"op_timeout,omitempty"`
 }
 
 func (l LimitConfig) CheckRoomNameLength(name string) bool {
@@ -598,9 +625,10 @@ var DefaultConfig = Config{
 		MaxAPIRequestBodySize:            10 << 20, // 10 MiB
 	},
 	Bulk: BulkConfig{
-		Workers:  0, // GOMAXPROCS
-		MaxItems: 5000,
-		Timeout:  30 * time.Second,
+		Workers:   0, // GOMAXPROCS
+		MaxItems:  5000,
+		Timeout:   30 * time.Second,
+		OpTimeout: 500 * time.Millisecond,
 	},
 	Logging: LoggingConfig{
 		PionLevel: "error",
