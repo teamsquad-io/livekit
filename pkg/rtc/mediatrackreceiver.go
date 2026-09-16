@@ -1173,6 +1173,28 @@ func (t *MediaTrackReceiver) PrimaryReceiver() sfu.TrackReceiver {
 	return receivers[0].TrackReceiver
 }
 
+// LiveSpatialLayers returns the spatial layers the SFU is receiving packets on RIGHT NOW for
+// this published track, as decided by the per-layer StreamTrackers of its receiver.
+//
+// AST-427. This is the one accessor for layer liveness (see layerliveness.go); it reuses the
+// already public TrackReceiver.GetLayeredBitrate() instead of adding a method to that
+// interface, which would force a regeneration of the counterfeiter fakes across the tree. The
+// bitrates it also computes are discarded: at a 10s scrape and ~36 concurrent rooms per origin
+// that is a handful of small allocations, far below the cost of widening the SFU's surface.
+//
+// The reading is taken from the ACTIVE receiver, so a codec-regressed track reports the
+// receiver actually delivering rather than the primary one.
+func (t *MediaTrackReceiver) LiveSpatialLayers() []int32 {
+	receiver := t.ActiveReceiver()
+	if receiver == nil {
+		return nil
+	}
+
+	layers, _ := receiver.GetLayeredBitrate()
+	slices.Sort(layers)
+	return layers
+}
+
 func (t *MediaTrackReceiver) ActiveReceiver() sfu.TrackReceiver {
 	for _, r := range t.loadReceivers() {
 		if r.IsRegressed() {
