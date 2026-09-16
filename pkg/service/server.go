@@ -42,6 +42,7 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/livekit-server/version"
 )
 
@@ -94,6 +95,28 @@ func NewLivekitServer(conf *config.Config,
 		turnServer:  turnServer,
 		currentNode: currentNode,
 		closedChan:  make(chan struct{}),
+	}
+
+	// AST-429. Registered only when asked for, so a node with the feature off exports not one
+	// extra series. The collector reads the same accessor the API response filter reads, so the
+	// two presentations of layer liveness cannot drift apart.
+	if conf.LayerLiveness.Metrics {
+		prometheus.InitVideoLayerStats(
+			string(currentNode.NodeID()),
+			currentNode.NodeType(),
+			func() []prometheus.VideoLayerSample {
+				readings := roomManager.VideoLayerLiveness()
+				samples := make([]prometheus.VideoLayerSample, 0, len(readings))
+				for _, r := range readings {
+					samples = append(samples, prometheus.VideoLayerSample{
+						Declared: r.Declared,
+						Live:     r.Live,
+						Degraded: r.Degraded(),
+					})
+				}
+				return samples
+			},
+		)
 	}
 
 	middlewares := []negroni.Handler{
