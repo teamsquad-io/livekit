@@ -115,6 +115,8 @@ type Config struct {
 	EnableParticipantDataBlob bool `yaml:"enable_participant_data_blob,omitempty"`
 
 	API APIConfig `yaml:"api,omitempty"`
+
+	LayerLiveness LayerLivenessConfig `yaml:"layer_liveness,omitempty"`
 }
 
 type RTCConfig struct {
@@ -467,6 +469,29 @@ type DebugHandlerConfig struct {
 	Port uint32 `yaml:"port,omitempty"`
 }
 
+// LayerLivenessConfig — AST-429. Exposes the set of simulcast spatial layers the SFU is
+// currently receiving packets on, which it already computes internally (StreamTrackerManager)
+// and today never publishes outside the process.
+//
+// Both switches are OFF by default and both are read-only observation: no codepath here
+// touches bandwidth allocation, the forwarder, or the stream trackers themselves.
+type LayerLivenessConfig struct {
+	// Metrics exports the livekit_video_layer_* gauges on the existing Prometheus listener.
+	// Fixed cardinality: 3 series (one per spatial layer) for live, 3 for declared and 1 for
+	// degraded, per node — no room, participant or track ever becomes a label.
+	Metrics bool `yaml:"metrics,omitempty"`
+
+	// APIFilter makes GetParticipant/ListParticipants report ONLY the layers currently
+	// delivering, instead of the ones declared when the track was published.
+	//
+	// This is a SEMANTIC change to a field every SDK sees, which is why it is off by default
+	// and why the filter lives in the API response path only (see
+	// rtc.ParticipantInfoWithLiveLayers). It requires api.enable_psrpc_for_get_list_participants,
+	// because the other path answers from the room store snapshot, which the live node does
+	// not refresh per layer transition.
+	APIFilter bool `yaml:"api_filter,omitempty"`
+}
+
 type ForwardStatsConfig struct {
 	SummaryInterval time.Duration `yaml:"summary_interval,omitempty"`
 	ReportInterval  time.Duration `yaml:"report_interval,omitempty"`
@@ -630,6 +655,13 @@ func NewConfig(confString string, strictMode bool, c *cli.Command, baseFlags []c
 
 	if err := conf.RTC.Validate(conf.Development); err != nil {
 		return nil, fmt.Errorf("could not validate RTC config: %v", err)
+	}
+
+	// Fail loudly instead of silently doing nothing: with the psrpc path off, GetParticipant
+	// and ListParticipants answer from the room store, which the filter never sees.
+	if conf.LayerLiveness.APIFilter && !conf.API.EnablePsrpcForGetListParticpants {
+		return nil, errors.New("layer_liveness.api_filter requires api.enable_psrpc_for_get_list_participants: " +
+			"without it GetParticipant/ListParticipants are answered from the room store and the filter would be a no-op")
 	}
 
 	conf.NormalizeTURNTTLs()

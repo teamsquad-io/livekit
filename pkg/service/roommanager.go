@@ -821,7 +821,7 @@ func (r *RoomManager) ListParticipants(ctx context.Context, req *livekit.ListPar
 	participants := room.GetParticipants()
 	items := make([]*livekit.ParticipantInfo, 0, len(participants))
 	for _, p := range participants {
-		items = append(items, p.ToProto())
+		items = append(items, r.withLiveLayers(p))
 	}
 
 	return &livekit.ListParticipantsResponse{
@@ -840,7 +840,41 @@ func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParti
 		return nil, ErrParticipantNotFound
 	}
 
-	return participant.ToProto(), nil
+	return r.withLiveLayers(participant), nil
+}
+
+// withLiveLayers is the AST-429 API response filter, and it is ONLY that: it runs on the proto
+// these two psrpc handlers are about to return, never on the TrackInfo the allocator, the
+// forwarder or the signalling path read. With layer_liveness.api_filter off (the default) it
+// is p.ToProto() and not a byte more.
+//
+// It lives here, on the node that actually hosts the room, because that is the only place the
+// live reading exists — the other RoomService path answers from the room store snapshot, which
+// is exactly why `lk room participants get` reports a ladder that never moves.
+func (r *RoomManager) withLiveLayers(p types.LocalParticipant) *livekit.ParticipantInfo {
+	pi := p.ToProto()
+	if !r.config.LayerLiveness.APIFilter {
+		return pi
+	}
+
+	return rtc.ParticipantInfoWithLiveLayers(pi, rtc.LiveVideoLayersByTrack(p))
+}
+
+// VideoLayerLiveness reads every published video track on this node. It is the sampler behind
+// the livekit_video_layer_* gauges; it takes only read locks and allocates nothing beyond the
+// returned slice, and it is called once per Prometheus scrape.
+func (r *RoomManager) VideoLayerLiveness() []rtc.VideoLayerLiveness {
+	r.lock.RLock()
+	rooms := slices.Collect(maps.Values(r.rooms))
+	r.lock.RUnlock()
+
+	var out []rtc.VideoLayerLiveness
+	for _, room := range rooms {
+		for _, p := range room.GetParticipants() {
+			out = append(out, rtc.VideoLayerLivenessOfParticipant(p)...)
+		}
+	}
+	return out
 }
 
 func (r *RoomManager) RemoveParticipant(ctx context.Context, req *livekit.RoomParticipantIdentity) (*livekit.RemoveParticipantResponse, error) {
