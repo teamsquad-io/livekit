@@ -29,17 +29,27 @@ type StreamTrackerPacketConfig struct {
 }
 
 var (
+	// CyclesRequired is the same 4 on every rung (AST-449). It used to be 20 on rungs 1 and 2,
+	// which is not a confirmation window, it is a penalty: one 500 ms cycle below
+	// SamplesRequired condemns a rung, and 20 cycles are then needed to take it back, so half a
+	// second of silence costs 10 seconds of exclusion. Measured in production on 2026-09-21: a
+	// 720p rung delivering 18-24 fps left availableLayers twice in 5 minutes, 10 s each time, to
+	// the second, while the publisher never stopped.
+	//
+	// 4 is not a new number. It is what rung 0 has always used, and nothing about a higher
+	// spatial rung asks for a longer confirmation: the extra evidence a fat rung needs is a
+	// RATE, and that is SamplesRequired (5 against 1), not a duration.
 	DefaultStreamTrackerPacketConfigVideo = map[int32]StreamTrackerPacketConfig{
 		0: {SamplesRequired: 1,
 			CyclesRequired: 4,
 			CycleDuration:  500 * time.Millisecond,
 		},
 		1: {SamplesRequired: 5,
-			CyclesRequired: 20,
+			CyclesRequired: 4,
 			CycleDuration:  500 * time.Millisecond,
 		},
 		2: {SamplesRequired: 5,
-			CyclesRequired: 20,
+			CyclesRequired: 4,
 			CycleDuration:  500 * time.Millisecond,
 		},
 	}
