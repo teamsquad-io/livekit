@@ -115,6 +115,8 @@ type Config struct {
 	EnableParticipantDataBlob bool `yaml:"enable_participant_data_blob,omitempty"`
 
 	API APIConfig `yaml:"api,omitempty"`
+
+	LayerLiveness LayerLivenessConfig `yaml:"layer_liveness,omitempty"`
 }
 
 type RTCConfig struct {
@@ -465,6 +467,33 @@ type PrometheusConfig struct {
 
 type DebugHandlerConfig struct {
 	Port uint32 `yaml:"port,omitempty"`
+}
+
+// LayerLivenessConfig — AST-429. Exposes the set of simulcast spatial layers the SFU is
+// currently receiving packets on, which it already computes internally (StreamTrackerManager)
+// and today never publishes outside the process.
+//
+// Both switches are OFF by default and both are read-only observation: no codepath here
+// touches bandwidth allocation, the forwarder, or the stream trackers themselves.
+type LayerLivenessConfig struct {
+	// Metrics exports the livekit_video_layer_* gauges on the existing Prometheus listener.
+	// Fixed cardinality: 3 series (one per spatial layer) for live, 3 for declared and 1 for
+	// degraded, per node — no room, participant or track ever becomes a label.
+	Metrics bool `yaml:"metrics,omitempty"`
+
+	// APIFilter is DEPRECATED AND IGNORED since AST-449. It used to make
+	// GetParticipant/ListParticipants report only the layers currently delivering.
+	//
+	// It was withdrawn because it reported a rung dead that the publisher was delivering
+	// without interruption at 2.4-2.8 Mbps and 21-24 fps (measured in production on
+	// 2026-09-22), and because it did so by mutating a standard LiveKit response that other
+	// consumers read. The declared and the live ladder are now reported side by side on
+	// /astream/v1/rooms/{room}/video-layers instead, with nothing filtered out.
+	//
+	// THE FIELD IS KEPT ON PURPOSE. Config parsing is strict by default, so deleting it would
+	// stop every node whose livekit.yaml still carries it from booting. It is ignored, and
+	// NewLivekitServer logs a warning when it is set, so it cannot be believed to be in effect.
+	APIFilter bool `yaml:"api_filter,omitempty"`
 }
 
 type ForwardStatsConfig struct {

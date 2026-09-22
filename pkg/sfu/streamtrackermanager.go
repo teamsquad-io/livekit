@@ -128,6 +128,11 @@ type StreamTrackerManager struct {
 	availableLayers  []int32
 	maxExpectedLayer int32
 
+	// AST-449. Since-when and how-many-times for each spatial layer. Written only from the
+	// three places below that move availableLayers, read only by LayerLiveness(). See
+	// layerledger.go.
+	layerLedger [buffer.DefaultMaxLayerSpatial + 1]layerLedgerEntry
+
 	closed core.Fuse
 
 	listener StreamTrackerManagerListener
@@ -149,6 +154,7 @@ func NewStreamTrackerManager(
 		maxTemporalLayerSeen: buffer.InvalidLayerTemporal,
 		clockRate:            clockRate,
 	}
+	s.initLayerLedger(time.Now())
 
 	switch trackInfo.Source {
 	case livekit.TrackSource_SCREEN_SHARE:
@@ -331,6 +337,7 @@ func (s *StreamTrackerManager) RemoveAllTrackers() {
 		s.trackers[layer] = nil
 	}
 	s.availableLayers = make([]int32, 0)
+	s.noteAllLayersDeadLocked(time.Now()) // AST-449 ledger, see layerledger.go
 
 	s.maxExpectedLayer = buffer.InvalidLayerSpatial
 	s.maxExpectedLayerFromTrackInfoLocked(true)
@@ -520,6 +527,7 @@ func (s *StreamTrackerManager) addAvailableLayer(layer int32) {
 
 	s.availableLayers = append(s.availableLayers, layer)
 	slices.Sort(s.availableLayers)
+	s.noteLayerStateLocked(layer, true, time.Now()) // AST-449 ledger, see layerledger.go
 
 	// check if new layer is the max layer
 	isMaxLayerChange := s.availableLayers[len(s.availableLayers)-1] == layer
@@ -555,6 +563,7 @@ func (s *StreamTrackerManager) removeAvailableLayer(layer int32) {
 	}
 	slices.Sort(newLayers)
 	s.availableLayers = newLayers
+	s.noteLayerStateLocked(layer, false, time.Now()) // AST-449 ledger, see layerledger.go
 
 	s.logger.Debugw(
 		"available layers changed - layer gone",

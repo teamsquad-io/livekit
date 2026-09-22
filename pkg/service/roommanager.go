@@ -843,6 +843,39 @@ func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParti
 	return participant.ToProto(), nil
 }
 
+// RoomParticipants returns the participants of a room hosted ON THIS NODE, and false when the
+// room is not here. It is the lookup behind the /astream/v1 video-layers endpoint
+// (videolayers.go), which has to run on the room's own node because that is the only place the
+// live layer reading exists.
+//
+// The false is load-bearing: "this room is not on this node" is a different answer from "this
+// room has no participants", and the endpoint reports them differently.
+func (r *RoomManager) RoomParticipants(ctx context.Context, name livekit.RoomName) (livekit.RoomID, []types.LocalParticipant, bool) {
+	room := r.GetRoom(ctx, name)
+	if room == nil {
+		return "", nil, false
+	}
+
+	return room.ID(), room.GetParticipants(), true
+}
+
+// VideoLayerLiveness reads every published video track on this node. It is the sampler behind
+// the livekit_video_layer_* gauges; it takes only read locks and allocates nothing beyond the
+// returned slice, and it is called once per Prometheus scrape.
+func (r *RoomManager) VideoLayerLiveness() []rtc.VideoLayerLiveness {
+	r.lock.RLock()
+	rooms := slices.Collect(maps.Values(r.rooms))
+	r.lock.RUnlock()
+
+	var out []rtc.VideoLayerLiveness
+	for _, room := range rooms {
+		for _, p := range room.GetParticipants() {
+			out = append(out, rtc.VideoLayerLivenessOfParticipant(p)...)
+		}
+	}
+	return out
+}
+
 func (r *RoomManager) RemoveParticipant(ctx context.Context, req *livekit.RoomParticipantIdentity) (*livekit.RemoveParticipantResponse, error) {
 	room, participant, err := r.roomAndParticipantForReq(ctx, req)
 	if err != nil {

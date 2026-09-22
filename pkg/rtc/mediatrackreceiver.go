@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -1171,6 +1172,68 @@ func (t *MediaTrackReceiver) PrimaryReceiver() sfu.TrackReceiver {
 		return dr.Receiver()
 	}
 	return receivers[0].TrackReceiver
+}
+
+// layerLedgerReader is the slice of a receiver LiveVideoLayers needs. Declared at the consumer,
+// structurally, for the same reason liveVideoLayersReader is (layerliveness.go): adding a method
+// to sfu.TrackReceiver would force a regeneration of every counterfeiter fake in the tree for a
+// read-only accessor. *sfu.WebRTCReceiver satisfies it through the *sfu.ReceiverBase it embeds.
+//
+// A receiver that does NOT satisfy it (a DummyReceiver standing in before the real one arrives,
+// a fake in a test) makes LiveVideoLayers report "no reading", which is the honest answer and a
+// different one from "nothing is delivering".
+type layerLedgerReader interface {
+	StreamTrackerManager() *sfu.StreamTrackerManager
+}
+
+// LiveVideoLayers returns the spatial layers the SFU is receiving packets on RIGHT NOW for this
+// published track, each with how long it has been in that state and how many times it has
+// flipped, as decided by the per-layer StreamTrackers of its receiver.
+//
+// The second return value is FALSE when there is no reading to be had at all. It is not the same
+// as an empty first value, which means the reading was taken and nothing is delivering — see
+// VideoLayerLiveness.LiveKnown.
+//
+// AST-449. This is the one accessor for layer liveness (see layerliveness.go). The reading is
+// taken from the ACTIVE receiver, so a codec-regressed track reports the receiver actually
+// delivering rather than the primary one.
+func (t *MediaTrackReceiver) LiveVideoLayers() ([]LiveLayer, bool) {
+	receiver := t.ActiveReceiver()
+	if receiver == nil {
+		return nil, false
+	}
+
+	ledger, ok := receiver.(layerLedgerReader)
+	if !ok {
+		return nil, false
+	}
+	stm := ledger.StreamTrackerManager()
+	if stm == nil {
+		return nil, false
+	}
+
+	// One clock reading for the whole track, so its rungs are all measured against the same
+	// instant rather than against a clock that moved between them.
+	now := time.Now()
+
+	entries := stm.LayerLiveness()
+	out := make([]LiveLayer, 0, len(entries))
+	for _, e := range entries {
+		if !e.Live {
+			continue
+		}
+
+		sinceMs := now.Sub(e.Since).Milliseconds()
+		if sinceMs < 0 {
+			sinceMs = 0
+		}
+		out = append(out, LiveLayer{
+			SpatialLayer: e.SpatialLayer,
+			SinceMs:      sinceMs,
+			Transitions:  e.Transitions,
+		})
+	}
+	return out, true
 }
 
 func (t *MediaTrackReceiver) ActiveReceiver() sfu.TrackReceiver {
