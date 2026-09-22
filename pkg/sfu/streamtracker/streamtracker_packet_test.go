@@ -220,3 +220,49 @@ func TestStreamTracker(t *testing.T) {
 		tracker.Stop()
 	})
 }
+
+// AST-449. The readmission window of a video rung, driven through the real impl with the shipped
+// defaults. It is the wall clock that is asserted, not the constant, so the test stays honest if
+// CycleDuration moves instead of CyclesRequired.
+func TestStreamTrackerPacketVideoReadmissionWindow(t *testing.T) {
+	// A 720p simulcast rung at ~2.4 Mbps is ~250 pps, so ~125 packets in a 500 ms cycle.
+	const packetsPerCycle = 125
+
+	for layer := int32(0); layer <= 2; layer++ {
+		cfg := DefaultStreamTrackerPacketConfigVideo[layer]
+		impl := NewStreamTrackerPacket(StreamTrackerPacketParams{Config: cfg, Logger: logger.GetLogger()})
+
+		feed := func(n int) {
+			for i := 0; i < n; i++ {
+				impl.Observe(false, 0)
+			}
+		}
+
+		feed(1) // first packet: active
+		// Control: a rung delivering at rate is never condemned, however long it runs.
+		for c := 0; c < 30; c++ {
+			feed(packetsPerCycle)
+			require.NotEqual(t, StreamStatusChangeStopped, impl.CheckStatus(),
+				"layer %d: a rung at rate was condemned on cycle %d", layer, c)
+		}
+
+		// One silent cycle condemns. That part is upstream's and stays: the rung really was not
+		// delivering for those 500 ms.
+		require.Equal(t, StreamStatusChangeStopped, impl.CheckStatus(),
+			"layer %d: a silent cycle did not condemn the rung", layer)
+
+		cycles := 0
+		for impl.CheckStatus() != StreamStatusChangeActive {
+			feed(packetsPerCycle)
+			cycles++
+			require.Less(t, cycles, 100, "layer %d: rung never readmitted", layer)
+		}
+		readmission := time.Duration(cycles) * cfg.CycleDuration
+
+		// 2 s is rung 0's window, unchanged since upstream. No rung may cost more than that to
+		// take back: rungs 1 and 2 used to cost 10 s, and a publisher that never stopped spent
+		// that whole time out of availableLayers.
+		require.LessOrEqual(t, readmission, 2*time.Second,
+			"layer %d: readmission takes %v (%d cycles of %v)", layer, readmission, cycles, cfg.CycleDuration)
+	}
+}
