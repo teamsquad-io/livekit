@@ -481,14 +481,18 @@ type LayerLivenessConfig struct {
 	// degraded, per node — no room, participant or track ever becomes a label.
 	Metrics bool `yaml:"metrics,omitempty"`
 
-	// APIFilter makes GetParticipant/ListParticipants report ONLY the layers currently
-	// delivering, instead of the ones declared when the track was published.
+	// APIFilter is DEPRECATED AND IGNORED since AST-449. It used to make
+	// GetParticipant/ListParticipants report only the layers currently delivering.
 	//
-	// This is a SEMANTIC change to a field every SDK sees, which is why it is off by default
-	// and why the filter lives in the API response path only (see
-	// rtc.ParticipantInfoWithLiveLayers). It requires api.enable_psrpc_for_get_list_participants,
-	// because the other path answers from the room store snapshot, which the live node does
-	// not refresh per layer transition.
+	// It was withdrawn because it reported a rung dead that the publisher was delivering
+	// without interruption at 2.4-2.8 Mbps and 21-24 fps (measured in production on
+	// 2026-09-22), and because it did so by mutating a standard LiveKit response that other
+	// consumers read. The declared and the live ladder are now reported side by side on
+	// /astream/v1/rooms/{room}/video-layers instead, with nothing filtered out.
+	//
+	// THE FIELD IS KEPT ON PURPOSE. Config parsing is strict by default, so deleting it would
+	// stop every node whose livekit.yaml still carries it from booting. It is ignored, and
+	// NewLivekitServer logs a warning when it is set, so it cannot be believed to be in effect.
 	APIFilter bool `yaml:"api_filter,omitempty"`
 }
 
@@ -655,13 +659,6 @@ func NewConfig(confString string, strictMode bool, c *cli.Command, baseFlags []c
 
 	if err := conf.RTC.Validate(conf.Development); err != nil {
 		return nil, fmt.Errorf("could not validate RTC config: %v", err)
-	}
-
-	// Fail loudly instead of silently doing nothing: with the psrpc path off, GetParticipant
-	// and ListParticipants answer from the room store, which the filter never sees.
-	if conf.LayerLiveness.APIFilter && !conf.API.EnablePsrpcForGetListParticpants {
-		return nil, errors.New("layer_liveness.api_filter requires api.enable_psrpc_for_get_list_participants: " +
-			"without it GetParticipant/ListParticipants are answered from the room store and the filter would be a no-op")
 	}
 
 	conf.NormalizeTURNTTLs()

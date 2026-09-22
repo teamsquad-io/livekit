@@ -821,7 +821,7 @@ func (r *RoomManager) ListParticipants(ctx context.Context, req *livekit.ListPar
 	participants := room.GetParticipants()
 	items := make([]*livekit.ParticipantInfo, 0, len(participants))
 	for _, p := range participants {
-		items = append(items, r.withLiveLayers(p))
+		items = append(items, p.ToProto())
 	}
 
 	return &livekit.ListParticipantsResponse{
@@ -840,24 +840,23 @@ func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParti
 		return nil, ErrParticipantNotFound
 	}
 
-	return r.withLiveLayers(participant), nil
+	return participant.ToProto(), nil
 }
 
-// withLiveLayers is the AST-429 API response filter, and it is ONLY that: it runs on the proto
-// these two psrpc handlers are about to return, never on the TrackInfo the allocator, the
-// forwarder or the signalling path read. With layer_liveness.api_filter off (the default) it
-// is p.ToProto() and not a byte more.
+// RoomParticipants returns the participants of a room hosted ON THIS NODE, and false when the
+// room is not here. It is the lookup behind the /astream/v1 video-layers endpoint
+// (videolayers.go), which has to run on the room's own node because that is the only place the
+// live layer reading exists.
 //
-// It lives here, on the node that actually hosts the room, because that is the only place the
-// live reading exists — the other RoomService path answers from the room store snapshot, which
-// is exactly why `lk room participants get` reports a ladder that never moves.
-func (r *RoomManager) withLiveLayers(p types.LocalParticipant) *livekit.ParticipantInfo {
-	pi := p.ToProto()
-	if !r.config.LayerLiveness.APIFilter {
-		return pi
+// The false is load-bearing: "this room is not on this node" is a different answer from "this
+// room has no participants", and the endpoint reports them differently.
+func (r *RoomManager) RoomParticipants(ctx context.Context, name livekit.RoomName) (livekit.RoomID, []types.LocalParticipant, bool) {
+	room := r.GetRoom(ctx, name)
+	if room == nil {
+		return "", nil, false
 	}
 
-	return rtc.ParticipantInfoWithLiveLayers(pi, rtc.LiveVideoLayersByTrack(p))
+	return room.ID(), room.GetParticipants(), true
 }
 
 // VideoLayerLiveness reads every published video track on this node. It is the sampler behind

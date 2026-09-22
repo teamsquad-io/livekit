@@ -97,9 +97,24 @@ func NewLivekitServer(conf *config.Config,
 		closedChan:  make(chan struct{}),
 	}
 
-	// AST-429. Registered only when asked for, so a node with the feature off exports not one
-	// extra series. The collector reads the same accessor the API response filter reads, so the
-	// two presentations of layer liveness cannot drift apart.
+	// AST-449. The filter this switch used to turn on is gone; the field survives only so a
+	// livekit.yaml that still carries it keeps booting under strict config parsing. Say so out
+	// loud, because a switch that is set and ignored is worse than one that was never there.
+	if conf.LayerLiveness.APIFilter {
+		logger.Warnw("layer_liveness.api_filter is deprecated and IGNORED since AST-449", nil,
+			"replacement", "GET /astream/v1/rooms/{room}/video-layers",
+			"effect", "GetParticipant/ListParticipants report the declared ladder, as upstream")
+	}
+
+	// AST-429, amended by AST-449. Registered only when asked for, so a node with the feature
+	// off exports not one extra series. The collector reads the same accessor the video-layers
+	// endpoint reads, so the two presentations of layer liveness cannot drift apart.
+	//
+	// READING THE ZEROS. declared_total{layer="0"} equals the number of published video tracks on
+	// this node, so a scrape with no publisher shows 0/0/0 legitimately. Read it against
+	// livekit_track_published_total{kind="VIDEO"} before calling it a broken gauge: on 2026-09-21
+	// a 0/0/0 on va-2 was reported as a defect and the node simply had no room at the time — its
+	// last one had closed 75 minutes earlier and the next publish was 8 minutes later.
 	if conf.LayerLiveness.Metrics {
 		prometheus.InitVideoLayerStats(
 			string(currentNode.NodeID()),
@@ -110,7 +125,7 @@ func NewLivekitServer(conf *config.Config,
 				for _, r := range readings {
 					samples = append(samples, prometheus.VideoLayerSample{
 						Declared: r.Declared,
-						Live:     r.Live,
+						Live:     r.LiveSpatialLayers(),
 						Degraded: r.Degraded(),
 					})
 				}
@@ -172,6 +187,9 @@ func NewLivekitServer(conf *config.Config,
 	xtwirp.RegisterServer(mux, sipServer)
 	rtcService.SetupRoutes(mux)
 	whipService.SetupRoutes(mux)
+	// AST-449. Same mux, therefore the same APIKeyAuthMiddleware every other route gets; the
+	// handler then requires the same video.roomAdmin grant for this room that RoomService does.
+	NewVideoLayersService(currentNode.NodeID(), roomManager.RoomParticipants).SetupRoutes(mux)
 	mux.Handle("/agent", agentService)
 	mux.HandleFunc("/", s.defaultHandler)
 

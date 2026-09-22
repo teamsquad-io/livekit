@@ -70,96 +70,85 @@ func TestDeclaredSpatialLayers(t *testing.T) {
 }
 
 func TestVideoLayerLivenessDegraded(t *testing.T) {
-	require.False(t, VideoLayerLiveness{Declared: []int32{0, 1, 2}, Live: []int32{0, 1, 2}}.Degraded())
-	require.True(t, VideoLayerLiveness{Declared: []int32{0, 1, 2}, Live: []int32{0, 1}}.Degraded())
-	require.True(t, VideoLayerLiveness{Declared: []int32{0}, Live: nil}.Degraded())
-	// a rung delivering that was never declared is not a degradation
-	require.False(t, VideoLayerLiveness{Declared: []int32{0}, Live: []int32{0, 1}}.Degraded())
-}
-
-func TestParticipantInfoWithLiveLayers(t *testing.T) {
-	newPI := func() *livekit.ParticipantInfo {
-		return &livekit.ParticipantInfo{
-			Sid:      "PA_pub",
-			Identity: "publisher",
-			Tracks: []*livekit.TrackInfo{
-				simulcastTrackInfo(),
-				{Sid: "TR_audio", Type: livekit.TrackType_AUDIO, MimeType: "audio/opus"},
-			},
+	live := func(layers ...int32) []LiveLayer {
+		out := make([]LiveLayer, 0, len(layers))
+		for _, l := range layers {
+			out = append(out, LiveLayer{SpatialLayer: l, SinceMs: 1000, Transitions: 1})
 		}
+		return out
 	}
 
-	t.Run("keeps only the rungs currently delivering, in both layer lists", func(t *testing.T) {
-		pi := newPI()
-		out := ParticipantInfoWithLiveLayers(pi, map[livekit.TrackID][]int32{"TR_video": {0, 1}})
+	require.False(t, VideoLayerLiveness{Declared: []int32{0, 1, 2}, Live: live(0, 1, 2), LiveKnown: true}.Degraded())
+	require.True(t, VideoLayerLiveness{Declared: []int32{0, 1, 2}, Live: live(0, 1), LiveKnown: true}.Degraded())
+	require.True(t, VideoLayerLiveness{Declared: []int32{0}, Live: nil, LiveKnown: true}.Degraded())
+	// a rung delivering that was never declared is not a degradation
+	require.False(t, VideoLayerLiveness{Declared: []int32{0}, Live: live(0, 1), LiveKnown: true}.Degraded())
 
-		require.Len(t, out.Tracks[0].Layers, 2)
-		require.Equal(t, int32(0), out.Tracks[0].Layers[0].SpatialLayer)
-		require.Equal(t, int32(1), out.Tracks[0].Layers[1].SpatialLayer)
-		require.Len(t, out.Tracks[0].Codecs[0].Layers, 2)
-
-		// CONTROL POSITIVO: the input is untouched, so the internal model the allocator and the
-		// signalling path read cannot be affected by an API response.
-		require.Len(t, pi.Tracks[0].Layers, 3)
-		require.Len(t, pi.Tracks[0].Codecs[0].Layers, 3)
-	})
-
-	t.Run("nothing delivering empties the ladder", func(t *testing.T) {
-		out := ParticipantInfoWithLiveLayers(newPI(), map[livekit.TrackID][]int32{"TR_video": {}})
-		require.Empty(t, out.Tracks[0].Layers)
-		require.Empty(t, out.Tracks[0].Codecs[0].Layers)
-	})
-
-	t.Run("a track with no reading is left alone", func(t *testing.T) {
-		out := ParticipantInfoWithLiveLayers(newPI(), map[livekit.TrackID][]int32{"TR_other": {0}})
-		require.Len(t, out.Tracks[0].Layers, 3)
-	})
-
-	t.Run("audio is never touched", func(t *testing.T) {
-		out := ParticipantInfoWithLiveLayers(newPI(), map[livekit.TrackID][]int32{"TR_audio": {}})
-		require.Equal(t, "TR_audio", out.Tracks[1].Sid)
-		require.Empty(t, out.Tracks[1].Layers)
-		require.Len(t, out.Tracks[0].Layers, 3)
-	})
-
-	t.Run("an empty reading set is a no-op", func(t *testing.T) {
-		pi := newPI()
-		require.Same(t, pi, ParticipantInfoWithLiveLayers(pi, nil))
-	})
+	// AST-449. NO READING IS NOT A DEGRADATION. This is the whole point of LiveKnown: a track
+	// we cannot read anything about must not be counted as one whose encoder stopped, or the
+	// degraded gauge climbs every time a track is between receivers.
+	require.False(t, VideoLayerLiveness{Declared: []int32{0, 1, 2}, Live: nil, LiveKnown: false}.Degraded())
+	require.Nil(t, VideoLayerLiveness{Declared: []int32{0}, Live: live(0), LiveKnown: false}.LiveSpatialLayers())
+	require.Equal(t, []int32{0, 2}, VideoLayerLiveness{Live: live(0, 2), LiveKnown: true}.LiveSpatialLayers())
 }
 
 // fakeLiveTrack is a types.MediaTrack that also reports liveness, which is what *MediaTrack is
 // in production. The embedded fake supplies the rest of the (large) interface.
 type fakeLiveTrack struct {
 	*typesfakes.FakeMediaTrack
-	ti   *livekit.TrackInfo
-	live []int32
+	ti    *livekit.TrackInfo
+	live  []LiveLayer
+	known bool
 }
 
-func (f *fakeLiveTrack) TrackInfo() *livekit.TrackInfo { return f.ti }
-func (f *fakeLiveTrack) LiveSpatialLayers() []int32    { return f.live }
+func (f *fakeLiveTrack) TrackInfo() *livekit.TrackInfo        { return f.ti }
+func (f *fakeLiveTrack) LiveVideoLayers() ([]LiveLayer, bool) { return f.live, f.known }
 
-func newFakeLiveTrack(ti *livekit.TrackInfo, kind livekit.TrackType, live []int32) *fakeLiveTrack {
+func newFakeLiveTrack(ti *livekit.TrackInfo, kind livekit.TrackType, live []LiveLayer, known bool) *fakeLiveTrack {
 	fake := &typesfakes.FakeMediaTrack{}
 	fake.IDReturns(livekit.TrackID(ti.Sid))
 	fake.KindReturns(kind)
-	return &fakeLiveTrack{FakeMediaTrack: fake, ti: ti, live: live}
+	return &fakeLiveTrack{FakeMediaTrack: fake, ti: ti, live: live, known: known}
 }
 
 func TestVideoLayerLivenessOf(t *testing.T) {
 	t.Run("video track reporting liveness", func(t *testing.T) {
-		track := newFakeLiveTrack(simulcastTrackInfo(), livekit.TrackType_VIDEO, []int32{0, 1})
+		track := newFakeLiveTrack(simulcastTrackInfo(), livekit.TrackType_VIDEO, []LiveLayer{
+			{SpatialLayer: 0, SinceMs: 4200, Transitions: 3},
+			{SpatialLayer: 1, SinceMs: 900, Transitions: 11},
+		}, true)
 		reading, ok := VideoLayerLivenessOf(track)
 		require.True(t, ok)
 		require.Equal(t, livekit.TrackID("TR_video"), reading.TrackID)
 		require.Equal(t, []int32{0, 1, 2}, reading.Declared)
-		require.Equal(t, []int32{0, 1}, reading.Live)
+		require.True(t, reading.LiveKnown)
+		require.Equal(t, []int32{0, 1}, reading.LiveSpatialLayers())
+		require.Equal(t, int64(900), reading.Live[1].SinceMs)
+		require.Equal(t, uint64(11), reading.Live[1].Transitions)
 		require.True(t, reading.Degraded())
+	})
+
+	// AST-449. The two zero-length answers are DIFFERENT facts and the reading has to carry
+	// which one it is, or a consumer tears down a subscription on a track it cannot see.
+	t.Run("nothing delivering is not the same as no reading", func(t *testing.T) {
+		nothing, ok := VideoLayerLivenessOf(
+			newFakeLiveTrack(simulcastTrackInfo(), livekit.TrackType_VIDEO, []LiveLayer{}, true))
+		require.True(t, ok)
+		require.True(t, nothing.LiveKnown)
+		require.Empty(t, nothing.Live)
+		require.True(t, nothing.Degraded())
+
+		unknown, ok := VideoLayerLivenessOf(
+			newFakeLiveTrack(simulcastTrackInfo(), livekit.TrackType_VIDEO, nil, false))
+		require.True(t, ok)
+		require.False(t, unknown.LiveKnown)
+		require.Empty(t, unknown.Live)
+		require.False(t, unknown.Degraded())
 	})
 
 	t.Run("audio is skipped", func(t *testing.T) {
 		ti := &livekit.TrackInfo{Sid: "TR_audio", Type: livekit.TrackType_AUDIO, MimeType: "audio/opus"}
-		_, ok := VideoLayerLivenessOf(newFakeLiveTrack(ti, livekit.TrackType_AUDIO, nil))
+		_, ok := VideoLayerLivenessOf(newFakeLiveTrack(ti, livekit.TrackType_AUDIO, nil, false))
 		require.False(t, ok)
 	})
 

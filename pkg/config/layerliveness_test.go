@@ -35,18 +35,31 @@ func TestLayerLivenessConfig(t *testing.T) {
 		require.False(t, conf.LayerLiveness.APIFilter)
 	})
 
-	t.Run("the API filter refuses to boot as a silent no-op", func(t *testing.T) {
-		_, err := NewConfig("layer_liveness:\n  api_filter: true\n", true, nil, nil)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "enable_psrpc_for_get_list_participants")
+	// AST-449. The filter is gone, but the field is not: config parsing is STRICT by default
+	// (cmd/server: strictMode = !--disable-strict-config), so a node whose livekit.yaml still
+	// says api_filter would refuse to boot if the field were deleted. Every origin of the va
+	// fleet carries it today, so this is the test that keeps the next restart from being an
+	// outage. NewLivekitServer warns when it is set; here we only pin that it parses.
+	t.Run("the retired API filter still parses under strict config", func(t *testing.T) {
+		conf, err := NewConfig("layer_liveness:\n  api_filter: true\n", true, nil, nil)
+		require.NoError(t, err)
+		require.True(t, conf.LayerLiveness.APIFilter)
 	})
 
-	t.Run("the API filter with its prerequisite", func(t *testing.T) {
+	t.Run("and it no longer drags a prerequisite behind it", func(t *testing.T) {
 		conf, err := NewConfig(
 			"api:\n  enable_psrpc_for_get_list_participants: true\nlayer_liveness:\n  api_filter: true\n",
 			true, nil, nil,
 		)
 		require.NoError(t, err)
 		require.True(t, conf.LayerLiveness.APIFilter)
+		require.True(t, conf.API.EnablePsrpcForGetListParticpants)
+	})
+
+	// CONTROL NEGATIVO del control anterior: an unknown key under the same block DOES fail, so
+	// the test above is proving that api_filter is accepted, not that strict mode is off.
+	t.Run("strict mode is really on", func(t *testing.T) {
+		_, err := NewConfig("layer_liveness:\n  api_filtr: true\n", true, nil, nil)
+		require.Error(t, err)
 	})
 }
