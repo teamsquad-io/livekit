@@ -115,6 +115,13 @@ func (r *simulcastReceiver) IsRegressed() bool {
 	return r.regressTo != nil
 }
 
+// RegressedTo is the receiver this one regressed to, or nil if it never regressed. AST-498.
+func (r *simulcastReceiver) RegressedTo() sfu.TrackReceiver {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return r.regressTo
+}
+
 // -----------------------------------------------------
 
 type MediaTrackReceiverParams struct {
@@ -1194,11 +1201,15 @@ type layerLedgerReader interface {
 // as an empty first value, which means the reading was taken and nothing is delivering — see
 // VideoLayerLiveness.LiveKnown.
 //
-// AST-449. This is the one accessor for layer liveness (see layerliveness.go). The reading is
-// taken from the ACTIVE receiver, so a codec-regressed track reports the receiver actually
-// delivering rather than the primary one.
+// AST-449. This is the one accessor for layer liveness (see layerliveness.go).
+//
+// AST-498. The reading is taken from the FORWARDED receiver, which is what the comment above used
+// to promise and the code did not deliver: it read `ActiveReceiver()`, and on a regressed track
+// that returns the receiver that REGRESSED (`r.IsRegressed()` is true on the old one, the H.264
+// that stopped), not the backup it regressed to. So a track that fell back from H.264 to VP8
+// reported every rung as not delivering while VP8 was flowing on all of them.
 func (t *MediaTrackReceiver) LiveVideoLayers() ([]LiveLayer, bool) {
-	receiver := t.ActiveReceiver()
+	receiver := t.ForwardedReceiver()
 	if receiver == nil {
 		return nil, false
 	}
@@ -1234,6 +1245,49 @@ func (t *MediaTrackReceiver) LiveVideoLayers() ([]LiveLayer, bool) {
 		})
 	}
 	return out, true
+}
+
+// ForwardedReceiver is the receiver whose packets subscribers are being sent RIGHT NOW. AST-498.
+//
+// It is NOT ActiveReceiver, and the difference is the whole point. ActiveReceiver (upstream, used
+// for the audio level and the connection score) returns the receiver that is flagged as regressed
+// — the one that STOPPED. After `HandleReceiverCodecChange` every downtrack is moved to the
+// backup (`simulcastReceiver.RegressTo` -> `DownTrack.SetReceiver`), so the bytes come from the
+// backup, and that is the one returned here.
+//
+// The backup may still be the DummyReceiver that stood in for it before its media arrived; it is
+// unwrapped when the real one is there, and returned as is otherwise (its Codec() is still right).
+//
+// Not regressed -> ActiveReceiver(), byte for byte the receiver every consumer used before.
+func (t *MediaTrackReceiver) ForwardedReceiver() sfu.TrackReceiver {
+	for _, r := range t.loadReceivers() {
+		to := r.RegressedTo()
+		if to == nil {
+			continue
+		}
+		if dr, ok := to.(*DummyReceiver); ok {
+			if real := dr.Receiver(); real != nil {
+				return real
+			}
+		}
+		return to
+	}
+	return t.ActiveReceiver()
+}
+
+// ForwardedMimeType is the codec of ForwardedReceiver: the codec subscribers are being sent, as
+// opposed to TrackInfo.MimeType, which is fixed when the track is published and is NOT updated by
+// a codec regression. False when there is no receiver to ask. AST-498.
+func (t *MediaTrackReceiver) ForwardedMimeType() (mime.MimeType, bool) {
+	r := t.ForwardedReceiver()
+	if r == nil {
+		return mime.MimeTypeUnknown, false
+	}
+	m := mime.NormalizeMimeType(r.Codec().MimeType)
+	if m == mime.MimeTypeUnknown {
+		return mime.MimeTypeUnknown, false
+	}
+	return m, true
 }
 
 func (t *MediaTrackReceiver) ActiveReceiver() sfu.TrackReceiver {

@@ -82,6 +82,11 @@ type VideoLayerLiveness struct {
 	Declared  []int32
 	Live      []LiveLayer
 	LiveKnown bool
+
+	// ForwardedMimeType is the codec the SFU is sending subscribers RIGHT NOW (AST-498), which a
+	// codec regression moves and TrackInfo.MimeType does not. MimeTypeUnknown = no receiver to ask,
+	// which says nothing; it is never a guess.
+	ForwardedMimeType mime.MimeType
 }
 
 // LiveSpatialLayers is Live reduced to bare indices, which is all the Prometheus gauge counts.
@@ -124,6 +129,7 @@ func (l VideoLayerLiveness) Degraded() bool {
 type liveVideoLayersReader interface {
 	TrackInfo() *livekit.TrackInfo
 	LiveVideoLayers() ([]LiveLayer, bool)
+	ForwardedMimeType() (mime.MimeType, bool)
 }
 
 // The assertion is the gate, not documentation. *MediaTrack is the ONLY concrete type that ever
@@ -148,11 +154,13 @@ func VideoLayerLivenessOf(track types.MediaTrack) (VideoLayerLiveness, bool) {
 	}
 
 	live, known := reader.LiveVideoLayers()
+	forwarded, _ := reader.ForwardedMimeType()
 	return VideoLayerLiveness{
-		TrackID:   track.ID(),
-		Declared:  DeclaredSpatialLayers(reader.TrackInfo()),
-		Live:      live,
-		LiveKnown: known,
+		TrackID:           track.ID(),
+		Declared:          DeclaredSpatialLayers(reader.TrackInfo()),
+		Live:              live,
+		LiveKnown:         known,
+		ForwardedMimeType: forwarded,
 	}, true
 }
 

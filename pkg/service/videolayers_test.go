@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 
 	"github.com/livekit/livekit-server/pkg/rtc"
@@ -41,6 +42,13 @@ type fakeLiveTrack struct {
 	ti    *livekit.TrackInfo
 	live  []rtc.LiveLayer
 	known bool
+	// forwarded — what ForwardedMimeType reports (AST-498). Zero value = MimeTypeUnknown = "no
+	// receiver to ask", which is what every test written before AST-498 implicitly assumed.
+	forwarded mime.MimeType
+}
+
+func (f *fakeLiveTrack) ForwardedMimeType() (mime.MimeType, bool) {
+	return f.forwarded, f.forwarded != mime.MimeTypeUnknown
 }
 
 func (f *fakeLiveTrack) TrackInfo() *livekit.TrackInfo            { return f.ti }
@@ -182,6 +190,28 @@ func TestVideoLayersJSONShape(t *testing.T) {
 	require.Contains(t, string(raw), `"live":[]`)
 	require.NotContains(t, string(raw), `"live":null`)
 	require.NotContains(t, string(raw), `"tracks":null`)
+}
+
+// AST-498. `activeMimeType` is the codec the SFU forwards; `mimeType` stays the published one. The
+// two arms are the regression (they differ) and "no receiver to ask" (empty, never a guess, and
+// never a copy of mimeType — a copy would read as "confirmed H.264" to the packager).
+func TestAST498ActiveMimeTypeOnTheWire(t *testing.T) {
+	at := time.Date(2026, 10, 2, 9, 19, 53, 0, time.UTC)
+
+	regressed := newFakeLiveTrack(publisherTrackInfo(), nil, true)
+	regressed.forwarded = mime.MimeTypeVP8
+	resp := buildVideoLayersResponse("r", "RM", "ND", at, []types.LocalParticipant{fakePublisher(regressed)})
+	require.Len(t, resp.Tracks, 1)
+	require.Equal(t, "video/H264", resp.Tracks[0].MimeType, "mimeType must stay TrackInfo.MimeType: other consumers read it")
+	require.Equal(t, "video/VP8", resp.Tracks[0].ActiveMimeType)
+
+	raw, err := json.Marshal(resp)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"activeMimeType":"video/VP8"`)
+
+	unknown := newFakeLiveTrack(publisherTrackInfo(), nil, false)
+	resp = buildVideoLayersResponse("r", "RM", "ND", at, []types.LocalParticipant{fakePublisher(unknown)})
+	require.Equal(t, "", resp.Tracks[0].ActiveMimeType, "no receiver to ask must read as unknown, not as the published codec")
 }
 
 // ---------------------------------------------------------------------------------------------
