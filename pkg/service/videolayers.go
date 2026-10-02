@@ -43,6 +43,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
@@ -119,7 +120,22 @@ type VideoLayersTrack struct {
 	TrackSid            string `json:"trackSid"`
 	ParticipantIdentity string `json:"participantIdentity"`
 	ParticipantSid      string `json:"participantSid"`
-	MimeType            string `json:"mimeType"`
+
+	// MimeType is TrackInfo.MimeType: the codec the track was PUBLISHED with. It is fixed at
+	// publish time and a codec regression does not move it.
+	MimeType string `json:"mimeType"`
+
+	// ActiveMimeType is the codec the SFU is sending subscribers RIGHT NOW (AST-498). It differs
+	// from MimeType after a codec regression: a publisher that declared H.264 with a VP8 backup and
+	// whose H.264 encoder failed is forwarded as VP8 while MimeType still says H.264. The packager
+	// decides forward-or-transcode on THIS field; deciding on MimeType rejected a live VP8 track
+	// in production on 2026-10-02.
+	//
+	// Empty when there is no receiver to ask — "not known", never a guess. It is a field of its own
+	// and not a rewrite of MimeType on purpose: MimeType is the TrackInfo every other consumer reads
+	// (ListParticipants, the control plane since AST-312, ParticipantUpdate to clients), and
+	// changing its meaning changes it for all of them at once, which is what AST-449 undid.
+	ActiveMimeType string `json:"activeMimeType"`
 
 	// Declared is the ladder the publisher announced when it published, and it carries the whole
 	// IDENTITY of every rung — quality, rid, spatial layer, dimensions, target bitrate. It is
@@ -204,12 +220,19 @@ func buildVideoLayersResponse(
 				ParticipantIdentity: pi.GetIdentity(),
 				ParticipantSid:      pi.GetSid(),
 				MimeType:            ti.GetMimeType(),
-				Declared:            declaredVideoLayers(ti),
+				Declared:            declaredVideoLayers(ti, mime.MimeTypeUnknown),
 				Live:                []LiveVideoLayer{},
 			}
 
 			if reading, ok := liveness[livekit.TrackID(ti.GetSid())]; ok {
 				track.LiveKnown = reading.LiveKnown
+				if reading.ForwardedMimeType != mime.MimeTypeUnknown {
+					track.ActiveMimeType = reading.ForwardedMimeType.String()
+					// AST-498 — `declared` describes the stream `live` is read from: the forwarded
+					// codec's ladder. Otherwise a single-layer VP8 backup (spatial 0) would be
+					// mapped onto the LOW rung of the H.264 ladder.
+					track.Declared = declaredVideoLayers(ti, reading.ForwardedMimeType)
+				}
 				for _, l := range reading.Live {
 					track.Live = append(track.Live, LiveVideoLayer{
 						SpatialLayer: l.SpatialLayer,
@@ -233,8 +256,8 @@ func buildVideoLayersResponse(
 // A video track with no layer list is a single-layer track, which the SFU treats as spatial layer
 // 0, and it is reported as one rung rather than as an empty ladder — the same rule
 // rtc.DeclaredSpatialLayers applies, and a test in this package pins the two together.
-func declaredVideoLayers(ti *livekit.TrackInfo) []DeclaredVideoLayer {
-	layers := rtc.DeclaredVideoLayers(ti)
+func declaredVideoLayers(ti *livekit.TrackInfo, m mime.MimeType) []DeclaredVideoLayer {
+	layers := rtc.DeclaredVideoLayersFor(ti, m)
 	if len(layers) == 0 {
 		return []DeclaredVideoLayer{{
 			SpatialLayer: 0,

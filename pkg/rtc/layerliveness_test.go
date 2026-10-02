@@ -19,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types/typesfakes"
@@ -99,6 +100,13 @@ type fakeLiveTrack struct {
 	ti    *livekit.TrackInfo
 	live  []LiveLayer
 	known bool
+	// forwarded — what ForwardedMimeType reports (AST-498). Zero value = MimeTypeUnknown = "no
+	// receiver to ask", which is what every test written before AST-498 implicitly assumed.
+	forwarded mime.MimeType
+}
+
+func (f *fakeLiveTrack) ForwardedMimeType() (mime.MimeType, bool) {
+	return f.forwarded, f.forwarded != mime.MimeTypeUnknown
 }
 
 func (f *fakeLiveTrack) TrackInfo() *livekit.TrackInfo        { return f.ti }
