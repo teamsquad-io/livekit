@@ -119,3 +119,42 @@ func TestAST498ForwardedReceiverUnwrapsTheDummy(t *testing.T) {
 	dummy.Upgrade(real)
 	require.Same(t, sfu.TrackReceiver(real), mtr.ForwardedReceiver())
 }
+
+// The accessor's Declared follows the forwarded codec too: it is what the Prometheus gauges and the
+// endpoint count against Live, and Live is read from the forwarded receiver.
+func TestAST498LivenessDeclaredFollowsTheForwardedCodec(t *testing.T) {
+	ti := simulcastTrackInfo()
+	ti.Codecs = append(ti.Codecs, &livekit.SimulcastCodecInfo{
+		MimeType: "video/VP8",
+		Layers:   []*livekit.VideoLayer{{Quality: livekit.VideoQuality_HIGH, SpatialLayer: 0, Width: 1280, Height: 720}},
+	})
+
+	track := newFakeLiveTrack(ti, livekit.TrackType_VIDEO, []LiveLayer{{SpatialLayer: 0}}, true)
+	track.forwarded = mime.MimeTypeVP8
+	reading, ok := VideoLayerLivenessOf(track)
+	require.True(t, ok)
+	require.Equal(t, []int32{0}, reading.Declared, "declared is the published ladder while live is the backup's")
+	require.False(t, reading.Degraded(), "a single-layer VP8 delivering its only rung reads as degraded")
+
+	// CONTROL: unknown forwarded codec -> the published ladder, as before AST-498.
+	track.forwarded = mime.MimeTypeUnknown
+	reading, _ = VideoLayerLivenessOf(track)
+	require.Equal(t, []int32{0, 1, 2}, reading.Declared)
+}
+
+// Unknown means "the published codec": the codec entry of TrackInfo.MimeType, NOT the deprecated
+// top-level list. They differ here on purpose so the two cannot be confused.
+func TestAST498UnknownForwardedMeansThePublishedCodec(t *testing.T) {
+	ti := &livekit.TrackInfo{
+		Sid: "TR_v", Type: livekit.TrackType_VIDEO, MimeType: "video/H264",
+		Layers: []*livekit.VideoLayer{
+			{Quality: livekit.VideoQuality_LOW, SpatialLayer: 0}, {Quality: livekit.VideoQuality_MEDIUM, SpatialLayer: 1},
+			{Quality: livekit.VideoQuality_HIGH, SpatialLayer: 2},
+		},
+		Codecs: []*livekit.SimulcastCodecInfo{{MimeType: "video/H264", Layers: []*livekit.VideoLayer{
+			{Quality: livekit.VideoQuality_LOW, SpatialLayer: 0}, {Quality: livekit.VideoQuality_HIGH, SpatialLayer: 1},
+		}}},
+	}
+	require.Equal(t, []int32{0, 1}, DeclaredSpatialLayersFor(ti, mime.MimeTypeUnknown))
+	require.Equal(t, DeclaredSpatialLayers(ti), DeclaredSpatialLayersFor(ti, mime.MimeTypeUnknown))
+}

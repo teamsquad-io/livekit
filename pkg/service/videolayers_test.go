@@ -214,6 +214,34 @@ func TestAST498ActiveMimeTypeOnTheWire(t *testing.T) {
 	require.Equal(t, "", resp.Tracks[0].ActiveMimeType, "no receiver to ask must read as unknown, not as the published codec")
 }
 
+// AST-498. `declared` describes the stream `live` is read from. A VP8 backup published as ONE 720p
+// layer (no rid -> spatial 0) has its own ladder in TrackInfo.Codecs; mapped onto the H.264 ladder,
+// spatial 0 is the LOW rung, and a consumer would condemn HIGH as "not delivering" while it is the
+// only thing flowing. With the forwarded codec unknown, the published codec's ladder, as before.
+func TestAST498DeclaredFollowsTheForwardedCodec(t *testing.T) {
+	at := time.Date(2026, 10, 2, 9, 19, 53, 0, time.UTC)
+	ti := publisherTrackInfo()
+	ti.Codecs = []*livekit.SimulcastCodecInfo{
+		{MimeType: "video/H264", Layers: ti.Layers},
+		{MimeType: "video/VP8", Layers: []*livekit.VideoLayer{
+			{Quality: livekit.VideoQuality_HIGH, SpatialLayer: 0, Width: 1280, Height: 720, Bitrate: 1700000},
+		}},
+	}
+
+	regressed := newFakeLiveTrack(ti, []rtc.LiveLayer{{SpatialLayer: 0}}, true)
+	regressed.forwarded = mime.MimeTypeVP8
+	resp := buildVideoLayersResponse("r", "RM", "ND", at, []types.LocalParticipant{fakePublisher(regressed)})
+	d := resp.Tracks[0].Declared
+	require.Len(t, d, 1, "declared is still the H.264 ladder while live is read from the VP8 receiver")
+	require.Equal(t, int32(0), d[0].SpatialLayer)
+	require.Equal(t, livekit.VideoQuality_HIGH.String(), d[0].Quality)
+
+	// CONTROL: forwarded codec unknown -> the published codec's ladder, three rungs, as before.
+	unknown := newFakeLiveTrack(ti, nil, false)
+	resp = buildVideoLayersResponse("r", "RM", "ND", at, []types.LocalParticipant{fakePublisher(unknown)})
+	require.Len(t, resp.Tracks[0].Declared, 3)
+}
+
 // ---------------------------------------------------------------------------------------------
 // the handler
 

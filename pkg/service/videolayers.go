@@ -220,7 +220,7 @@ func buildVideoLayersResponse(
 				ParticipantIdentity: pi.GetIdentity(),
 				ParticipantSid:      pi.GetSid(),
 				MimeType:            ti.GetMimeType(),
-				Declared:            declaredVideoLayers(ti),
+				Declared:            declaredVideoLayers(ti, mime.MimeTypeUnknown),
 				Live:                []LiveVideoLayer{},
 			}
 
@@ -228,6 +228,10 @@ func buildVideoLayersResponse(
 				track.LiveKnown = reading.LiveKnown
 				if reading.ForwardedMimeType != mime.MimeTypeUnknown {
 					track.ActiveMimeType = reading.ForwardedMimeType.String()
+					// AST-498 — `declared` describes the stream `live` is read from: the forwarded
+					// codec's ladder. Otherwise a single-layer VP8 backup (spatial 0) would be
+					// mapped onto the LOW rung of the H.264 ladder.
+					track.Declared = declaredVideoLayers(ti, reading.ForwardedMimeType)
 				}
 				for _, l := range reading.Live {
 					track.Live = append(track.Live, LiveVideoLayer{
@@ -252,8 +256,8 @@ func buildVideoLayersResponse(
 // A video track with no layer list is a single-layer track, which the SFU treats as spatial layer
 // 0, and it is reported as one rung rather than as an empty ladder — the same rule
 // rtc.DeclaredSpatialLayers applies, and a test in this package pins the two together.
-func declaredVideoLayers(ti *livekit.TrackInfo) []DeclaredVideoLayer {
-	layers := rtc.DeclaredVideoLayers(ti)
+func declaredVideoLayers(ti *livekit.TrackInfo, m mime.MimeType) []DeclaredVideoLayer {
+	layers := rtc.DeclaredVideoLayersFor(ti, m)
 	if len(layers) == 0 {
 		return []DeclaredVideoLayer{{
 			SpatialLayer: 0,

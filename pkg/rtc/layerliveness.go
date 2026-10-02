@@ -156,8 +156,11 @@ func VideoLayerLivenessOf(track types.MediaTrack) (VideoLayerLiveness, bool) {
 	live, known := reader.LiveVideoLayers()
 	forwarded, _ := reader.ForwardedMimeType()
 	return VideoLayerLiveness{
-		TrackID:           track.ID(),
-		Declared:          DeclaredSpatialLayers(reader.TrackInfo()),
+		TrackID: track.ID(),
+		// AST-498 — the ladder of the codec being FORWARDED, because that is the receiver Live is
+		// read from: declared and live must describe the same stream or their indices do not mean
+		// the same rung.
+		Declared:          DeclaredSpatialLayersFor(reader.TrackInfo(), forwarded),
 		Live:              live,
 		LiveKnown:         known,
 		ForwardedMimeType: forwarded,
@@ -194,8 +197,23 @@ func DeclaredVideoLayers(ti *livekit.TrackInfo) []*livekit.VideoLayer {
 	if ti == nil {
 		return nil
 	}
+	return DeclaredVideoLayersFor(ti, mime.NormalizeMimeType(ti.MimeType))
+}
 
-	layers := buffer.GetVideoLayersForMimeType(mime.NormalizeMimeType(ti.MimeType), ti)
+// DeclaredVideoLayersFor is DeclaredVideoLayers for the ladder of a given codec. AST-498: after a
+// codec regression the stream being forwarded (and read for liveness) is the backup's, whose ladder
+// may differ from the published codec's — a VP8 backup published as a single 720p layer reports
+// that layer as spatial 0, which in the H.264 ladder is the LOW rung. MimeTypeUnknown means "the
+// published codec", i.e. DeclaredVideoLayers.
+func DeclaredVideoLayersFor(ti *livekit.TrackInfo, m mime.MimeType) []*livekit.VideoLayer {
+	if ti == nil {
+		return nil
+	}
+	if m == mime.MimeTypeUnknown {
+		m = mime.NormalizeMimeType(ti.MimeType)
+	}
+
+	layers := buffer.GetVideoLayersForMimeType(m, ti)
 	out := make([]*livekit.VideoLayer, 0, len(layers))
 	seen := make(map[int32]struct{}, len(layers))
 	for _, l := range layers {
@@ -220,11 +238,16 @@ func DeclaredVideoLayers(ti *livekit.TrackInfo) []*livekit.VideoLayer {
 // SFU treats as spatial layer 0 (buffer.GetSpatialLayerForVideoQuality does exactly this), so it
 // is reported as [0] rather than as an empty ladder.
 func DeclaredSpatialLayers(ti *livekit.TrackInfo) []int32 {
+	return DeclaredSpatialLayersFor(ti, mime.MimeTypeUnknown)
+}
+
+// DeclaredSpatialLayersFor is DeclaredSpatialLayers for the ladder of a given codec (AST-498).
+func DeclaredSpatialLayersFor(ti *livekit.TrackInfo, m mime.MimeType) []int32 {
 	if ti == nil {
 		return nil
 	}
 
-	layers := DeclaredVideoLayers(ti)
+	layers := DeclaredVideoLayersFor(ti, m)
 	if len(layers) == 0 {
 		return []int32{0}
 	}
