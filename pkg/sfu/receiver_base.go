@@ -1096,31 +1096,6 @@ func (r *ReceiverBase) AddOnReady(fn func()) {
 }
 
 func (r *ReceiverBase) handleCodecChange(newCodec webrtc.RTPCodecParameters) {
-	// AST-498. A payload type change that stays within the SAME codec is not a codec change.
-	//
-	// The buffer reports every PT change (buffer_base.go, "possible codec change"), and Safari,
-	// iOS and Opera move from one H.264 profile to another mid-session — 86 "codec changed"
-	// H264->H264 in 46 sessions over 48 h of the production origins (2026-09-30..10-02). Upstream
-	// invalidates the receiver on all of them, and with a backup codec in TrackInfo.Codecs that
-	// REGRESSES the track to VP8: a device that encodes H.264 perfectly well ends up forwarded as
-	// VP8 (and our packager has to transcode it) for having switched profile.
-	//
-	// The receiver already keeps going on the new PT: the buffer adopted it before calling here, and
-	// every downtrack writes its own negotiated PT (DownTrack.getTranslatedPayloadType), so nothing
-	// downstream depends on the upstream PT. That is EXACTLY what happens today on every origin,
-	// where no publisher has a backup codec ("no backup codec found, can't regress codec") and those
-	// sessions keep their video. H.264 carries its parameter sets in band, so a profile change
-	// reaches decoders as a new SPS/PPS.
-	//
-	// A real codec change (H264 -> VP8) still invalidates, as upstream does.
-	if mime.NormalizeMimeType(newCodec.MimeType) == mime.NormalizeMimeType(r.params.Codec.MimeType) {
-		r.params.Logger.Infow(
-			"payload type changed within the same codec, not a codec change: receiver keeps going",
-			"mime", newCodec.MimeType, "newPayload", newCodec.PayloadType, "fmtp", newCodec.SDPFmtpLine,
-		)
-		return
-	}
-
 	// codec fallback is not supported mid-session, i.e. change of codec via payload type change,
 	// set the codec state to invalid once it happens
 	r.SetCodecState(ReceiverCodecStateInvalid)
